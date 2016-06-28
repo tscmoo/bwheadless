@@ -9,15 +9,32 @@
 
 #include "sc_hook.h"
 
+#include "strf.h"
+
+template<typename...T>
+std::string format(const char*fmt, T&&...args) {
+	std::string r;
+	tsc::strf::format(r, fmt, std::forward<T>(args)...);
+	return r;
+}
+
+HANDLE output_handle = INVALID_HANDLE_VALUE;
+
+template<typename...T>
+void log(const char*fmt, T&&...args) {
+	auto s = format(fmt, std::forward<T>(args)...);
+	DWORD written;
+	WriteFile(output_handle, s.data(), s.size(), &written, nullptr);
+}
+
 void inject(HANDLE h_proc);
 void image_set(const void*dst, const void*src, size_t size);
 extern int is_injected;
 extern HMODULE hmodule;
-extern DWORD parent_pid;
 DWORD main_thread_id;
 
 void fatal_error(const char* desc) {
-	printf("fatal error: %s\n", desc);
+	log("fatal error: %s\n", desc);
 	TerminateProcess(GetCurrentProcess(), (UINT)-1);
 }
 
@@ -193,7 +210,7 @@ void* g_players = (void*)0x57EEE0;
 void* g_player_colors = (void*)0x57F21C;
 
 void run() {
-	printf("this is WinMain\n");
+	log("this is WinMain\n");
 
 	const char* player_name = "playername";
 
@@ -214,7 +231,7 @@ void run() {
 		fatal_error("InitializeNetworkProvider failed");
 	}
 
-	printf("game mode is %d\n", g_game_mode);
+	log("game mode is %d\n", g_game_mode);
 
 	if (host_game) {
 
@@ -222,7 +239,7 @@ void run() {
 
 		uint32_t data[8];
 		if (!((int(__stdcall*)(const char*, uint32_t*, int))0x4BF5D0)(map_fn, data, 0)) { // ReadMapData
-			printf("failed to read map '%s'\n", map_fn);
+			log("failed to read map '%s'\n", map_fn);
 			fatal_error("failed to load map");
 		}
 
@@ -233,14 +250,14 @@ void run() {
 		std::array<uint16_t, 4>& force_name_index = (std::array<uint16_t, 4>&)data[3];
 		std::array<uint8_t, 4>& force_flags = (std::array<uint8_t, 4>&)data[5];
 
-		for (size_t i = 0; i < 8; ++i) printf("player %d force: %d\n", i, player_force[i]);
-		for (size_t i = 0; i < 4; ++i) printf("force %d name '%s' flags %d\n", i, remove_nonprintable(get_string(force_name_index[i])).c_str(), force_flags[i]);
+		for (size_t i = 0; i < 8; ++i) log("player %d force: %d\n", i, player_force[i]);
+		for (size_t i = 0; i < 4; ++i) log("force %d name '%s' flags %d\n", i, remove_nonprintable(get_string(force_name_index[i])).c_str(), force_flags[i]);
 
 		uint16_t& map_tile_width = *(uint16_t*)0x57F1D6;
 		uint16_t& map_tile_height = *(uint16_t*)0x57F1D6;
 
-		printf("scenario name: '%s'  description: '%s'\n", remove_nonprintable(scenario_name).c_str(), remove_nonprintable(scenario_description).c_str());
-		printf("size %d %d\n", map_tile_width, map_tile_height);
+		log("scenario name: '%s'  description: '%s'\n", remove_nonprintable(scenario_name).c_str(), remove_nonprintable(scenario_description).c_str());
+		log("size %d %d\n", map_tile_width, map_tile_height);
 
 		void* players_struct = (void*)0x59BDB0;
 		int players_count = 0;
@@ -249,7 +266,7 @@ void run() {
 			if (type == 2 || type == 6) ++players_count;
 		}
 
-		printf("%d players\n", players_count);
+		log("%d players\n", players_count);
 
 		std::array<uint8_t, 0x8d> create_info {};
 
@@ -294,19 +311,19 @@ void run() {
 		char stat_string[128];
 		make_stat_string(stat_string, create_info.data() + 0x1c, 128);
 
-		printf("stat string '%s'\n", escape_nonprintable(stat_string));
+		log("stat string '%s'\n", escape_nonprintable(stat_string));
 
 		void* net_create_info = create_info.data() + 0x6d;
 
 		uint32_t mode_flags = get_mode_flags(net_create_info);
 
-		printf("mode_flags %x\n", mode_flags);
+		log("mode_flags %x\n", mode_flags);
 
 		int(__stdcall*SNetCreateLadderGame)(const char* game_name, const char* password, const char* stat, uint32_t game_type, uint32_t ladder_type, uint32_t mode_flags, void* net_create_info, size_t net_create_info_size, int players, const char* host_player_name, const char*, int* player_id);
 		(void*&)SNetCreateLadderGame = (void*)0x410118;
 
 		if (!SNetCreateLadderGame(game_name, nullptr, stat_string, game_type, 0, mode_flags, net_create_info, 0x20, players_count, player_name, "", &g_local_storm_id)) {
-			printf("failed to create game, error %d\n", SErrGetLastError());
+			log("failed to create game, error %d\n", SErrGetLastError());
 			fatal_error("failed to create game");
 		}
 
@@ -319,20 +336,20 @@ void run() {
 		while (true) {
 
 			enum_games([&](void* ptr) {
-				printf("game %s\n", (char*)ptr + 4);
+				log("game %s\n", (char*)ptr + 4);
 				if (!join_game_data) join_game_data = ptr;
 			});
 
 			if (join_game_data) break;
 
-			printf(".");
+			log(".");
 
 			Sleep(100);
 		}
 
-		printf("game mode is %d\n", g_game_mode);
+		log("game mode is %d\n", g_game_mode);
 
-		printf("joining game '%s' on map '%s'\n", (char*)join_game_data + 4, (char*)join_game_data + 0x4d);
+		log("joining game '%s' on map '%s'\n", (char*)join_game_data + 4, (char*)join_game_data + 0x4d);
 
 		if (!JoinNetworkGame(join_game_data)) {
 			fatal_error("JoinNetworkGame failed");
@@ -345,7 +362,7 @@ void run() {
 		else fatal_error("failed to join game");
 	}
 
-	printf("game mode is %d\n", *(int*)0x596904);
+	log("game mode is %d\n", *(int*)0x596904);
 
 	int race = 2; // 0 zerg, 1 terran, 2 protoss, 6 random
 
@@ -355,12 +372,12 @@ void run() {
 	while (true) {
 
 		int r = ((int(__stdcall*)(int))0x4D4340)(0); // LobbyLoopCnt
-		if (r != 81) printf("r %d\n", r);
+		if (r != 81) log("r %d\n", r);
 
 		if (local_nation_id != -1 && !race_changed) {
 			race_changed = true;
 			change_race(race, local_nation_id);
-			printf("race changed\n");
+			log("race changed\n");
 
 			const char* cstr = "hello world";
 			__asm {
@@ -378,7 +395,7 @@ void run() {
 	int& game_mode = *(int*)0x596904;
 
 	if (game_mode != 1) {
-		printf("error: game_mode is %d\n", game_mode);
+		log("error: game_mode is %d\n", game_mode);
 		fatal_error("unexpected game mode");
 	}
 	game_mode = 3;
@@ -406,8 +423,8 @@ void run() {
 
 	*(int*)0x6D121C = 0; // mapStarted
 
-	printf("local_mask is %d\n", *(int*)0x057F0B0);
-	printf("g_LocalNationID is %d\n", *(int*)0x512684);
+	log("local_mask is %d\n", *(int*)0x057F0B0);
+	log("g_LocalNationID is %d\n", *(int*)0x512684);
 
 	newGame(1);
 
@@ -420,7 +437,7 @@ void run() {
 	bool& allow_send_turn = *(bool*)0x57EE78;
 	while (true) {
 		int r = ((int(*)())0x487070)(); // gameLoopTurns
-		//printf("GameLoopTurns %d\n", r);
+		//log("GameLoopTurns %d\n", r);
 		if (r) break;
 		if (game_state == 0) break;
 	}
@@ -432,7 +449,7 @@ void run() {
 
 		int r = ((int(*)())0x485F70)(); // RecvMessage
 
-		//printf("recv %d\n", r);
+		//log("recv %d\n", r);
 
 		*(int*)0x051CE94 = 0; // nextTickCount
 
@@ -440,10 +457,10 @@ void run() {
 
 		int game_loop_break_reason = *(int*)0x6D11F0;
 
-// 		printf("gameloop break reason is %d\n", *(int*)0x6D11F0);
-// 		printf("elapsedTime: %d\n", *(int*)0x057F23C);
+// 		log("gameloop break reason is %d\n", *(int*)0x6D11F0);
+// 		log("elapsedTime: %d\n", *(int*)0x057F23C);
 // 
-// 		printf("active player count: %d\n", ((int(*)())0x4C40F0)());
+// 		log("active player count: %d\n", ((int(*)())0x4C40F0)());
 
 		int map_tile_height = *(int16_t*)0x057F1D6;
 		((void(__stdcall*)(int, int))0x4982D0)(0, map_tile_height - 1); // DoVisibilityUpdate
@@ -452,7 +469,7 @@ void run() {
 
 	}
 
-	printf("game over\n");
+	log("game over\n");
 }
 
 void _WinMain_pre(hook_struct*e, hook_function*_f) {
@@ -463,11 +480,11 @@ void _WinMain_pre(hook_struct*e, hook_function*_f) {
 	try {
 		run();
 	} catch (const std::exception& e) {
-		printf("exception %s\n", e.what());
+		log("exception %s\n", e.what());
 		fatal_error("exception");
 	}
 
-	printf("done!\n");
+	log("done!\n");
 
 	TerminateProcess(GetCurrentProcess(), 0);
 
@@ -475,14 +492,14 @@ void _WinMain_pre(hook_struct*e, hook_function*_f) {
 
 void _doNetTBLError_pre(hook_struct*e, hook_function*_f) {
 
-	printf("net error %d\n", e->arg[0]);
+	log("net error %d\n", e->arg[0]);
 
 	uint16_t* tbl = *(uint16_t**)0x6D1220;
 	size_t n = e->arg[0];
 	if (n <= tbl[0]) {
 		const char* str = (char*)tbl + tbl[n];
-		printf("%s\n", str);
-	} else printf("no error string\n");
+		log("%s\n", str);
+	} else log("no error string\n");
 
 	fatal_error("network error");
 
@@ -490,12 +507,12 @@ void _doNetTBLError_pre(hook_struct*e, hook_function*_f) {
 
 void _on_lobby_chat_pre(hook_struct* e, hook_function* _f) {
 	e->calloriginal = false;
-	printf("chat (%d): %s\n", e->arg[0], (char*)e->_eax);
+	log("chat (%d): %s\n", e->arg[0], (char*)e->_eax);
 }
 
 void _on_lobby_start_game_pre(hook_struct* e, hook_function* _f) {
 	e->calloriginal = false;
-	printf("game start!\n");
+	log("game start!\n");
 }
 
 void _timeoutProcDropdown_pre(hook_struct* e, hook_function* _f) {
@@ -504,7 +521,7 @@ void _timeoutProcDropdown_pre(hook_struct* e, hook_function* _f) {
 	bool& allow_send_turn = *(bool*)0x57EE78;
 
 	while (!allow_send_turn) {
-		printf("waiting for players...\n");
+		log("waiting for players...\n");
 		((int(*)())0x485F70)(); // RecvMessage
 
 		int r = ((int(*)())0x486580)(); // RecvSaveTurns
@@ -515,35 +532,33 @@ void _timeoutProcDropdown_pre(hook_struct* e, hook_function* _f) {
 
 void _SetInGameInputProcs_pre(hook_struct* e, hook_function* _f) {
 	e->calloriginal = false;
-	//printf("SetInGameInputProcs called from %p\n", e->retaddress);
+	//log("SetInGameInputProcs called from %p\n", e->retaddress);
 	if (e->retaddress == (void*)0x46161A || e->retaddress == (void*)0x4616aa) {
-		printf("game has ended\n");
+		log("game has ended\n");
 		TerminateProcess(GetCurrentProcess(), 0);
 	}
-	//printf("ignoring SetInGameInputProcs\n");
+	//log("ignoring SetInGameInputProcs\n");
 }
 
 void _DisplayTextMessage_pre(hook_struct* e, hook_function* _f) {
 	e->calloriginal = false;
-	printf(":: %s\n", remove_nonprintable((const char*)e->_eax).c_str());
+	log(":: %s\n", remove_nonprintable((const char*)e->_eax).c_str());
 }
 
+HANDLE handle_process = INVALID_HANDLE_VALUE;
 
 int main() {
 
+	output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+
 	if (is_injected) {
-			
-		if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
-			AllocConsole();
-		}
-		freopen("CONIN$", "r", stdin);
-		freopen("CONOUT$", "w", stdout);
-		freopen("CONOUT$", "w", stderr);
+		
+		AttachConsole(ATTACH_PARENT_PROCESS);
 
-		printf("hello world, my parent process id is %d\n", parent_pid);
-		printf("I am loaded at 0x%p, target process is loaded at 0x%p\n", hmodule, GetModuleHandle(0));
+		log("hello world\n");
+		log("I am loaded at 0x%p, target process is loaded at 0x%p\n", hmodule, GetModuleHandle(0));
 
-		printf("load bwapi: %p\n", LoadLibraryA("BWAPI.dll"));
+		log("load bwapi: %p\n", LoadLibraryA("BWAPI.dll"));
 
 		HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, main_thread_id);
 
@@ -562,11 +577,18 @@ int main() {
 		hook((void*)0x48CD30, _DisplayTextMessage_pre, nullptr, HOOK_STDCALL | hookflag_eax, 3);
 
 		auto r = ResumeThread(h);
-		printf("resume: %d error %d\n", r, GetLastError());
+		log("resume: %d error %d\n", r, GetLastError());
 
 		ExitThread(0);
 
 	} else {
+
+		SetConsoleCtrlHandler([](DWORD type) {
+			if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
+				if (handle_process != INVALID_HANDLE_VALUE) TerminateProcess(handle_process, (UINT)-1);
+			}
+			return FALSE;
+		}, TRUE);
 
 		STARTUPINFOA si;
 		PROCESS_INFORMATION pi;
@@ -576,7 +598,12 @@ int main() {
 		std::string cmd = "Starcraft_multiinstance.exe";
 		//std::string cmd = "Starcraft.exe";
 		std::string dir = ".";
-		CreateProcessA(0, (LPSTR)cmd.c_str(), 0, 0, 0, CREATE_SUSPENDED, 0, dir.c_str(), &si, &pi);
+		if (!CreateProcessA(0, (LPSTR)cmd.c_str(), 0, 0, TRUE, CREATE_SUSPENDED, 0, dir.c_str(), &si, &pi)) {
+			log("Failed to start '%s'; error %d\n", cmd.c_str(), GetLastError());
+			return -1;
+		}
+
+		handle_process = pi.hProcess;
 
 		image_set(&main_thread_id, &pi.dwThreadId, sizeof(pi.dwThreadId));
 		inject(pi.hProcess);
