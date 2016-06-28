@@ -215,6 +215,10 @@ std::string GetErrorString(int id) {
 	return r;
 }
 
+void DestroyGame() {
+	((void(*)())0x4EE8C0)();
+}
+
 int16_t& g_game_mode = *(int16_t*)0x596904;
 int16_t& g_tileset = *(int16_t*)0x57F1DC;
 
@@ -248,11 +252,21 @@ void run() {
 
 	string_copy((char*)0x57EE9C, player_name, 25); // player name
 
+	// SMEM is local pc
 	if (!InitializeNetworkProvider('SMEM')) {
 		fatal_error("InitializeNetworkProvider failed");
 	}
 
-	log("game mode is %d\n", g_game_mode);
+	// BWAPI client server update happens in a hook to this function, which is
+	// used to process some dialog stuff. We don't want the dialog stuff, so we
+	// replace it by an empty function.
+	// BWAPI periodically (every 300ms) replaces this with its own function, which
+	// we call below while waiting for the game to start.
+	void(__stdcall*&dialog_layer_update_func)(void*, void*) = *(void(__stdcall**)(void*, void*))0x6cef88;
+	dialog_layer_update_func = [](void*, void*) {};
+	// This has to be set to some value that BWAPI does not recognize, or
+	// it will crash in the hook to the function above.
+	*(int*)0x6d11bc = -1; // glGluesMode
 
 	if (host_game) {
 
@@ -392,6 +406,9 @@ void run() {
 
 	while (true) {
 
+		// For BWAPI clients.
+		dialog_layer_update_func(nullptr, nullptr);
+
 		int r = ((int(__stdcall*)(int))0x4D4340)(0); // LobbyLoopCnt
 		if (r != 81) log("r %d\n", r);
 
@@ -490,6 +507,8 @@ void run() {
 
 	}
 
+	DestroyGame();
+
 	log("game over\n");
 }
 
@@ -555,6 +574,7 @@ void _SetInGameInputProcs_pre(hook_struct* e, hook_function* _f) {
 	e->calloriginal = false;
 	//log("SetInGameInputProcs called from %p\n", e->retaddress);
 	if (e->retaddress == (void*)0x46161A || e->retaddress == (void*)0x4616aa) {
+		DestroyGame();
 		log("game has ended\n");
 		TerminateProcess(GetCurrentProcess(), 0);
 	}
@@ -662,19 +682,15 @@ int main() {
 
 	output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
 
-	log("main, loaded at %p\n", GetModuleHandle(nullptr));
 	if (is_injected) {
 		
 		AttachConsole(ATTACH_PARENT_PROCESS);
-
-		log("hello world\n");
-		log("I am loaded at %p, target process is loaded at %p\n", hmodule, GetModuleHandle(0));
 
 		HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, main_thread_id);
 
 		init();
 
-		auto r = ResumeThread(h);
+		ResumeThread(h);
 
 		ExitThread(0);
 
@@ -717,7 +733,12 @@ int main() {
 			module_filename.resize(full_path_len);
 			if (module_filename.empty()) module_filename = path;
 
-			log("module_filename is '%s'\n", module_filename);
+			std::string directory = module_filename;
+			const char* directory_last_slash = strrchr(directory.c_str(), '\\');
+			if (directory_last_slash) {
+				directory.resize(directory_last_slash - directory.data());
+				SetCurrentDirectoryA(directory.c_str());
+			}
 
 			HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
 
@@ -730,7 +751,8 @@ int main() {
 			// after loading it. The other option is to manually load storm.dll
 			// and call DllEntryPoint with the "correct" parameters, but then BWAPI
 			// fails to work unless we redirect LoadLibrary/GetModuleHandle and 
-			// implement GetProcAddress.
+			// implement GetProcAddress (GetProcAddress is not implemented, so
+			// BWAPI will not work if this is set to true).
 			// Could also just statically link to storm.dll, but I'd rather not
 			// have the dependency.
 			bool load_storm_manually = false;
