@@ -80,7 +80,7 @@ void*hook_generate_entry(void*address,void*out_ins,size_t*out_size) {
 				continue;
 			}	
 		}
-		memcpy(out, dec_addr, size);
+		memcpy(out, dec_addr - size, size);
 		out += size;
 
 		if (total_size<5) {
