@@ -111,7 +111,7 @@ void injected_start() {
 	mainCRTStartup();
 }
 
-void inject(HANDLE h_proc) {
+void* inject(HANDLE h_proc, bool create_remote_thread) {
 
 	char*p = (char*)hmodule;
 	PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)p;
@@ -124,7 +124,7 @@ void inject(HANDLE h_proc) {
 	char*mem=(char*)VirtualAllocEx(h_proc,0,image_size,MEM_COMMIT,PAGE_EXECUTE_READWRITE);
 	if (!mem) {
 		fprintf(stderr,"VirtualAllocEx failed; error %d",GetLastError());
-		return;
+		return nullptr;
 	}
 
 	// calling GetModuleHandle(0) from the injected code would return the module of the target process,
@@ -168,22 +168,22 @@ void inject(HANDLE h_proc) {
 	if (!WriteProcessMemory(h_proc,mem,tmp_mem,image_size,0)) {
 		fprintf(stderr,"WriteProcessMemory failed; %d",GetLastError());
 		free(tmp_mem);
-		return;
+		return nullptr;
 	}
 	free(tmp_mem);
 
-	{
+	if (create_remote_thread) {
 		// create the remote thread...
 		HANDLE h=CreateRemoteThread(h_proc,NULL,0,(LPTHREAD_START_ROUTINE)(mem+start_offset),0,0,0);
 		if (!h) {
 			fprintf(stderr,"CreateRemoteThread failed; error %d",GetLastError());
-			return;
+			return nullptr;
 		}
 		CloseHandle(h);
+		// ...and the rest is up to fate
 	}
 
-	// ...and the rest is up to fate
-
+	return mem + start_offset;
 }
 
 
