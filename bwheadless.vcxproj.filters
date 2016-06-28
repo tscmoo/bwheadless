@@ -24,6 +24,9 @@
     <ClInclude Include="x86dec.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="load_pe.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="inject.cpp">

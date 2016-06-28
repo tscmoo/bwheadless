@@ -6,6 +6,7 @@
 
 #include <array>
 #include <vector>
+#include <map>
 
 #include "sc_hook.h"
 
@@ -27,11 +28,16 @@ void log(const char*fmt, T&&...args) {
 	WriteFile(output_handle, s.data(), s.size(), &written, nullptr);
 }
 
-void inject(HANDLE h_proc);
+void* inject(HANDLE h_proc, bool create_remote_thread);
 void image_set(const void*dst, const void*src, size_t size);
 extern int is_injected;
 extern HMODULE hmodule;
 DWORD main_thread_id;
+
+template<typename T>
+void image_set(T& dst, const T& src) {
+	image_set(&dst, &src, sizeof(T));
+}
 
 void fatal_error(const char* desc) {
 	log("fatal error: %s\n", desc);
@@ -192,6 +198,21 @@ void UpdateVisibilityHash(int y) {
 		mov edx, 0x497C30;
 		call edx;
 	};
+}
+
+std::string GetErrorString(int id) {
+	std::string r;
+	r.resize(0x100);
+	const char* cstr = r.data();
+	__asm {
+		mov ebx, id;
+		mov eax, 0x100;
+		mov ecx, cstr;
+		mov edx, 0x421140;
+		call edx;
+	}
+	r.resize(strlen(cstr));
+	return r;
 }
 
 int16_t& g_game_mode = *(int16_t*)0x596904;
@@ -545,39 +566,115 @@ void _DisplayTextMessage_pre(hook_struct* e, hook_function* _f) {
 	log(":: %s\n", remove_nonprintable((const char*)e->_eax).c_str());
 }
 
+void _ErrMessageBox_pre(hook_struct* e, hook_function* _f) {
+	fatal_error((const char*)e->arg[0]);
+}
+
+void _SysWarn_FileNotFound(hook_struct* e, hook_function* _f) {
+	auto str = GetErrorString(e->_ebx);
+	auto s = format("%s\n%s", str, (const char*)e->arg[0]);
+	fatal_error(s.c_str());
+}
+
+void* storm_module = nullptr;
+
+void _GetModuleHandleA_pre(hook_struct* e, hook_function* _f) {
+	if (e->arg[0] == 0) {
+		e->calloriginal = false;
+		e->retval = 0x400000;
+	} else if (storm_module) {
+		// Would need to implement GetProcAddress for this.
+// 		if (!_stricmp((char*)e->arg[0], "storm.dll") || !_stricmp((char*)e->arg[0], "storm")) {
+// 			e->calloriginal = false;
+// 			e->retval = (DWORD)storm_module;
+// 		}
+	}
+}
+
+std::string module_filename;
+// BWAPI checks the version of the executable, so this hook is needed
+// to make it check the correct file.
+// It's also used by BW to locate data files, so without this the executable
+// would need to be located in the StarCraft folder (it does not check the 
+// current working directory).
+void _GetModuleFileNameA_pre(hook_struct* e, hook_function* _f) {
+	if (e->arg[0] == 0) {
+		DWORD r = 0;
+		char* dst = (char*)e->arg[1];
+		DWORD size = e->arg[2];
+		if (size < module_filename.size() + 1) {
+			if (size) {
+				memcpy(dst, module_filename.data(), size - 1);
+				dst[size - 1] = 0;
+			}
+			SetLastError(ERROR_INSUFFICIENT_BUFFER);
+			r = size;
+		} else {
+			memcpy(dst, module_filename.data(), module_filename.size());
+			dst[module_filename.size()] = 0;
+			SetLastError(ERROR_SUCCESS);
+			r = module_filename.size();
+		}
+		e->calloriginal = false;
+		e->retval = r;
+	}
+}
+
+void _signal_pre(hook_struct* e, hook_function* _f) {
+	e->calloriginal = false;
+}
+
+void init() {
+
+	log("load bwapi: %p\n", LoadLibraryA("BWAPI.dll"));
+
+	hook((void*)0x4E0AE0, _WinMain_pre, nullptr, HOOK_STDCALL, 4);
+
+	hook((void*)0x4BB300, _doNetTBLError_pre, nullptr, HOOK_STDCALL | hookflag_eax | hookflag_ecx | hookflag_edx, 1);
+
+	hook((void*)0x4B8F10, _on_lobby_chat_pre, nullptr, HOOK_STDCALL | hookflag_eax, 1);
+
+	hook((void*)0x44FD30, _on_lobby_start_game_pre, nullptr, HOOK_STDCALL, 1);
+
+	hook((void*)0x4A3380, _timeoutProcDropdown_pre, nullptr, HOOK_CDECL, 0);
+
+	hook((void*)0x484CC0, _SetInGameInputProcs_pre, nullptr, HOOK_CDECL, 0);
+
+	hook((void*)0x48CD30, _DisplayTextMessage_pre, nullptr, HOOK_STDCALL | hookflag_eax, 3);
+
+	hook((void*)0x4208E0, _ErrMessageBox_pre, nullptr, HOOK_CDECL | hookflag_eax, 2);
+
+	hook((void*)0x4212C0, _SysWarn_FileNotFound, nullptr, HOOK_STDCALL | hookflag_ebx, 2);
+
+	hook((void*)0x40C8D5, _signal_pre, nullptr, HOOK_CDECL, 2);
+
+}
+
+
+#include "load_pe.h"
+
 HANDLE handle_process = INVALID_HANDLE_VALUE;
+
+// buffer to ensure the image size is large enough to contain starcraft (at 0x400000)
+char image_buffer[5 * 1024 * 1024];
 
 int main() {
 
 	output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
 
+	log("main, loaded at %p\n", GetModuleHandle(nullptr));
 	if (is_injected) {
 		
 		AttachConsole(ATTACH_PARENT_PROCESS);
 
 		log("hello world\n");
-		log("I am loaded at 0x%p, target process is loaded at 0x%p\n", hmodule, GetModuleHandle(0));
-
-		log("load bwapi: %p\n", LoadLibraryA("BWAPI.dll"));
+		log("I am loaded at %p, target process is loaded at %p\n", hmodule, GetModuleHandle(0));
 
 		HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, main_thread_id);
 
-		hook((void*)0x4E0AE0, _WinMain_pre, nullptr, HOOK_STDCALL, 4);
-
-		hook((void*)0x4BB300, _doNetTBLError_pre, nullptr, HOOK_STDCALL | hookflag_eax | hookflag_ecx | hookflag_edx, 1);
-
-		hook((void*)0x4B8F10, _on_lobby_chat_pre, nullptr, HOOK_STDCALL | hookflag_eax, 1);
-
-		hook((void*)0x44FD30, _on_lobby_start_game_pre, nullptr, HOOK_STDCALL, 1);
-
-		hook((void*)0x4A3380, _timeoutProcDropdown_pre, nullptr, HOOK_CDECL, 0);
-		
-		hook((void*)0x484CC0, _SetInGameInputProcs_pre, nullptr, HOOK_CDECL, 0);
-
-		hook((void*)0x48CD30, _DisplayTextMessage_pre, nullptr, HOOK_STDCALL | hookflag_eax, 3);
+		init();
 
 		auto r = ResumeThread(h);
-		log("resume: %d error %d\n", r, GetLastError());
 
 		ExitThread(0);
 
@@ -590,25 +687,113 @@ int main() {
 			return FALSE;
 		}, TRUE);
 
-		STARTUPINFOA si;
-		PROCESS_INFORMATION pi;
-		memset(&si, 0, sizeof(si));
-		si.cb = sizeof(si);
+		bool do_inject = false;
 
-		std::string cmd = "Starcraft_multiinstance.exe";
-		//std::string cmd = "Starcraft.exe";
-		std::string dir = ".";
-		if (!CreateProcessA(0, (LPSTR)cmd.c_str(), 0, 0, TRUE, CREATE_SUSPENDED, 0, dir.c_str(), &si, &pi)) {
-			log("Failed to start '%s'; error %d\n", cmd.c_str(), GetLastError());
-			return -1;
+		if (!do_inject) {
+
+			void* base = (void*)0x400000;
+
+			size_t size = 1024 * 1024 * 3; // starcraft image is slightly less than 3MB
+
+
+			char* b = image_buffer;
+			char* e = b + sizeof(image_buffer);
+			if ((char*)base < b || (char*)base >= e || (char*)base + size < b || (char*)base + size >= e) {
+				log("error: image_buffer is [%p,%p), which does not contain [%p,%p).\n", b, e, base, (char*)base + size);
+				log("This image must be linked with base address 0x300000 and relocations stripped.\n");
+				return -1;
+			}
+
+			pe_info pi;
+
+			const char* path = "Starcraft_multiinstance.exe";
+
+			module_filename.resize(0x100);
+			DWORD full_path_len = GetFullPathNameA(path, module_filename.size(), (char*)module_filename.data(), nullptr);
+			if (full_path_len > module_filename.size()) {
+				module_filename.resize(full_path_len);
+				full_path_len = GetFullPathNameA(path, module_filename.size(), (char*)module_filename.data(), nullptr);
+			}
+			module_filename.resize(full_path_len);
+			if (module_filename.empty()) module_filename = path;
+
+			log("module_filename is '%s'\n", module_filename);
+
+			HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+
+			hook(GetProcAddress(kernel32, "GetModuleHandleA"), _GetModuleHandleA_pre, nullptr, HOOK_STDCALL, 1);
+			hook(GetProcAddress(kernel32, "GetModuleFileNameA"), _GetModuleFileNameA_pre, nullptr, HOOK_STDCALL, 3);
+
+			// storm.dll fails to work if it is dynamically loaded. It detects this
+			// using the lpvReserved parameter of DllEntryPoint.
+			// The easy fix it to just set *(void*)(storm.dll + 0x5E5E4) to null
+			// after loading it. The other option is to manually load storm.dll
+			// and call DllEntryPoint with the "correct" parameters, but then BWAPI
+			// fails to work unless we redirect LoadLibrary/GetModuleHandle and 
+			// implement GetProcAddress.
+			// Could also just statically link to storm.dll, but I'd rather not
+			// have the dependency.
+			bool load_storm_manually = false;
+
+			std::map<std::string, HMODULE> loaded_modules;
+
+			if (load_storm_manually) {
+				pe_info storm_pi;
+
+				if (!load_pe("storm.dll", &storm_pi, false)) {
+					log("failed to load storm.dll\n");
+					return -1;
+				}
+
+				BOOL r = ((BOOL(__stdcall*)(HINSTANCE, DWORD, LPVOID))storm_pi.entry)((HINSTANCE)storm_pi.base, DLL_PROCESS_ATTACH, (void*)1);
+				if (!r) log("warning: storm.dll DllEntryPoint returned false\n");
+
+				storm_module = storm_pi.base;
+				loaded_modules["storm.dll"] = (HMODULE)storm_pi.base;
+
+			}
+
+			bool load_r = load_pe(path, &pi, true, loaded_modules);
+
+			if (load_r) {
+				init();
+
+				if (!load_storm_manually) {
+					*(void**)((char*)GetModuleHandleA("storm.dll") + 0x5E5E4) = nullptr;
+				}
+
+				((void(*)())pi.entry)();
+
+				log("entry returned\n");
+
+			} else {
+				log("failed to load\n");
+			}
+
+			return 0;
+
+
+		} else {
+			STARTUPINFOA si;
+			PROCESS_INFORMATION pi;
+			memset(&si, 0, sizeof(si));
+			si.cb = sizeof(si);
+
+			std::string cmd = "Starcraft_multiinstance.exe";
+			//std::string cmd = "Starcraft.exe";
+			std::string dir = ".";
+			if (!CreateProcessA(0, (LPSTR)cmd.c_str(), 0, 0, TRUE, CREATE_SUSPENDED, 0, dir.c_str(), &si, &pi)) {
+				log("Failed to start '%s'; error %d\n", cmd.c_str(), GetLastError());
+				return -1;
+			}
+
+			handle_process = pi.hProcess;
+
+			image_set(main_thread_id, pi.dwThreadId);
+			inject(pi.hProcess, true);
+
+			WaitForSingleObject(pi.hProcess, INFINITE);
 		}
-
-		handle_process = pi.hProcess;
-
-		image_set(&main_thread_id, &pi.dwThreadId, sizeof(pi.dwThreadId));
-		inject(pi.hProcess);
-
-		WaitForSingleObject(pi.hProcess, INFINITE);
 
 	}
 
