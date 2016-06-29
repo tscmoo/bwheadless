@@ -253,11 +253,10 @@ void* g_player_colors = (void*)0x57F21C;
 bool opt_host_game = false;
 std::string opt_player_name = "playername";
 std::string opt_game_name = opt_player_name;
-std::string opt_map_fn = "maps/(2)Ride of Valkyries.scx";
+std::string opt_map_fn;
 int opt_race = 6;
 
 void run() {
-	log("this is WinMain\n");
 
 	bool host_game = opt_host_game;
 	const char* game_name = opt_game_name.c_str();
@@ -314,7 +313,8 @@ void run() {
 		uint16_t& map_tile_width = *(uint16_t*)0x57F1D4;
 		uint16_t& map_tile_height = *(uint16_t*)0x57F1D6;
 
-		log("scenario name: '%s'  description: '%s'\n", remove_nonprintable(scenario_name).c_str(), remove_nonprintable(scenario_description).c_str());
+		//log("scenario name: '%s'  description: '%s'\n", remove_nonprintable(scenario_name).c_str(), remove_nonprintable(scenario_description).c_str());
+		log("scenario name: '%s'\n", remove_nonprintable(scenario_name).c_str());
 		log("size %d %d\n", map_tile_width, map_tile_height);
 
 		void* players_struct = (void*)0x59BDB0;
@@ -392,7 +392,7 @@ void run() {
 		while (true) {
 
 			enum_games([&](void* ptr) {
-				log("game %s\n", (char*)ptr + 4);
+				//log("game %s\n", (char*)ptr + 4);
 				if (!join_game_data) join_game_data = ptr;
 			});
 
@@ -716,6 +716,73 @@ void init() {
 
 }
 
+std::string exe_path = "StarCraft.exe";
+
+int parse_args(int argc, const char** argv) {
+
+	auto usage = [&]() {
+		log("Usage: %s [option]...\n", argv[0]);
+		log("A tool to start StarCraft: Brood War as a console application, with no graphics, sound or user input.\n");
+		log("\n");
+		log("  -e, --exe         The exe file to launch. Default 'StarCraft.exe'.\n");
+		log("  -h, --host        Host a game instead of joining.\n");
+		log("  -j, --join        Join instead of hosting. The first game that is found\n");
+		log("                    will be joined.\n");
+		log("  -n, --name NAME   The player name. Default 'playername'.\n");
+		log("  -g, --game NAME   The game name when hosting. Defaults to the player name.\n");
+		log("  -m, --map FILE    The map to use when hosting.\n");
+		log("  -r, --race RACE   Zerg, Terran, Protoss or random (case insensitive).\n");
+		log("                    Can also be the number 0, 1, 2 or 6 respectively.\n");
+	};
+
+	for (int i = 1; i < argc; ++i) {
+		const char* s = argv[i];
+		bool failed = false;
+		auto parm = [&]() {
+			++i;
+			if (i >= argc) {
+				log("error: '%s' requires an argument\n", s);
+				failed = true;
+				return "";
+			}
+			return argv[i];
+		};
+		if (!strcmp(s, "--exe") || !strcmp(s, "-e")) {
+			exe_path = parm();
+		} else if (!strcmp(s, "--host") || !strcmp(s, "-h")) {
+			opt_host_game = true;
+		} else if (!strcmp(s, "--join") || !strcmp(s, "-j")) {
+			opt_host_game = false;
+		} else if (!strcmp(s, "--name") || !strcmp(s, "-n")) {
+			opt_player_name = parm();
+		} else if (!strcmp(s, "--game") || !strcmp(s, "-g")) {
+			opt_game_name = parm();
+		} else if (!strcmp(s, "--map") || !strcmp(s, "-m")) {
+			opt_map_fn = parm();
+		} else if (!strcmp(s, "--race") || !strcmp(s, "-r")) {
+			const char* str = parm();
+			if (!_stricmp(str, "zerg")) opt_race = 0;
+			else if (!_stricmp(str, "terran")) opt_race = 1;
+			else if (!_stricmp(str, "protoss")) opt_race = 2;
+			else if (!_stricmp(str, "random")) opt_race = 6;
+			else opt_race = std::atoi(str);
+		} else if (!strcmp(s, "--help")) {
+			usage();
+			return -1;
+		} else {
+			log("invalid argument '%s'\n", s);
+			failed = true;
+		}
+		if (failed) return -1;
+	}
+
+	if (opt_host_game && opt_map_fn.empty()) {
+		log("error: You must specify a map (-m filename) when hosting.\n");
+		return -1;
+	}
+
+	return 0;
+}
 
 #include "load_pe.h"
 
@@ -724,7 +791,7 @@ HANDLE handle_process = INVALID_HANDLE_VALUE;
 // buffer to ensure the image size is large enough to contain starcraft (at 0x400000)
 char image_buffer[5 * 1024 * 1024];
 
-int main() {
+int main(int argc, const char** argv) {
 
 	output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
 
@@ -733,6 +800,23 @@ int main() {
 		AttachConsole(ATTACH_PARENT_PROCESS);
 
 		log("attached\n");
+
+		int argc = 0;
+		std::vector<const char*> argv;
+
+		const char* src = image_buffer;
+		argc = *(int*)src;
+		src += sizeof(int);
+		for (int i = 0; i < argc; ++i) {
+			argv.push_back(src);
+			src += strlen(src) + 1;
+		}
+
+		int r = parse_args(argc, argv.data());
+		if (r) fatal_error("parse_args failed");
+
+		if (argv.empty()) memset(image_buffer, 0, sizeof(int));
+		else memset(image_buffer, 0, argv.back() + strlen(argv.back()) - image_buffer + 1);
 
 		HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, main_thread_id);
 
@@ -744,7 +828,8 @@ int main() {
 
 	} else {
 
-		std::string exe_path = "StarCraft.exe";
+		int r = parse_args(argc, argv);
+		if (r) return r;
 
 		SetConsoleCtrlHandler([](DWORD type) {
 			if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
@@ -849,6 +934,17 @@ int main() {
 			}
 
 			handle_process = pi.hProcess;
+
+			char* dst = image_buffer;
+			image_set(*(int*)dst, argc);
+			dst += sizeof(int);
+			for (int i = 0; i < argc; ++i) {
+				size_t len = strlen(argv[i]) + 1;
+				if (dst + len >= (char*)image_buffer + sizeof(image_buffer)) fatal_error("not enough space for parameters");
+				image_set(dst, argv[i], len);
+				dst += len;
+			}
+			*dst = 0;
 
 			image_set(main_thread_id, pi.dwThreadId);
 			inject(pi.hProcess, true);
