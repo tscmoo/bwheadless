@@ -82,6 +82,22 @@ void string_copy(char* dst, const char* src, size_t max_size) {
 	*dst = 0;
 }
 
+std::string get_full_pathname(const char* path) {
+	std::string r;
+	r.resize(0x100);
+	DWORD full_path_len = GetFullPathNameA(path, r.size(), (char*)r.data(), nullptr);
+	if (full_path_len > r.size()) {
+		r.resize(full_path_len);
+		full_path_len = GetFullPathNameA(path, r.size(), (char*)r.data(), nullptr);
+	}
+	r.resize(full_path_len);
+	if (r.empty()) r = path;
+	return r;
+}
+std::string get_full_pathname(const std::string& path) {
+	return get_full_pathname(path.c_str());
+}
+
 int InitializeNetworkProvider(int id) {
 	int r;
 	__asm {
@@ -234,13 +250,20 @@ void* g_game_data = (void*)0x5967F8;
 void* g_players = (void*)0x57EEE0;
 void* g_player_colors = (void*)0x57F21C;
 
+bool opt_host_game = false;
+std::string opt_player_name = "playername";
+std::string opt_game_name = opt_player_name;
+std::string opt_map_fn = "maps/(2)Ride of Valkyries.scx";
+int opt_race = 6;
+
 void run() {
 	log("this is WinMain\n");
 
-	const char* player_name = "playername";
+	bool host_game = opt_host_game;
+	const char* game_name = opt_game_name.c_str();
 
-	bool host_game = false;
-	const char* game_name = "gamename";
+	const char* player_name = opt_player_name.c_str();
+	int race = opt_race; // 0 zerg, 1 terran, 2 protoss, 6 random
 
 	((void(*)())0x04DAF30)(); // PreInitData
 
@@ -270,10 +293,10 @@ void run() {
 
 	if (host_game) {
 
-		const char* map_fn = "maps/(2)Ride of Valkyries.scx";
+		std::string map_fn = get_full_pathname(opt_map_fn);
 
 		uint32_t data[8];
-		if (!((int(__stdcall*)(const char*, uint32_t*, int))0x4BF5D0)(map_fn, data, 0)) { // ReadMapData
+		if (!((int(__stdcall*)(const char*, uint32_t*, int))0x4BF5D0)(map_fn.c_str(), data, 0)) { // ReadMapData
 			log("failed to read map '%s'\n", map_fn);
 			fatal_error("failed to load map");
 		}
@@ -285,10 +308,10 @@ void run() {
 		std::array<uint16_t, 4>& force_name_index = (std::array<uint16_t, 4>&)data[3];
 		std::array<uint8_t, 4>& force_flags = (std::array<uint8_t, 4>&)data[5];
 
-		for (size_t i = 0; i < 8; ++i) log("player %d force: %d\n", i, player_force[i]);
-		for (size_t i = 0; i < 4; ++i) log("force %d name '%s' flags %d\n", i, remove_nonprintable(get_string(force_name_index[i])).c_str(), force_flags[i]);
+		//for (size_t i = 0; i < 8; ++i) log("player %d force: %d\n", i, player_force[i]);
+		//for (size_t i = 0; i < 4; ++i) log("force %d name '%s' flags %d\n", i, remove_nonprintable(get_string(force_name_index[i])).c_str(), force_flags[i]);
 
-		uint16_t& map_tile_width = *(uint16_t*)0x57F1D6;
+		uint16_t& map_tile_width = *(uint16_t*)0x57F1D4;
 		uint16_t& map_tile_height = *(uint16_t*)0x57F1D6;
 
 		log("scenario name: '%s'  description: '%s'\n", remove_nonprintable(scenario_name).c_str(), remove_nonprintable(scenario_description).c_str());
@@ -316,13 +339,11 @@ void run() {
 
 		offset<uint8_t>(&create_info, 0x24) = 1; // active player count
 		offset<uint8_t>(&create_info, 0x25) = players_count;
+		offset<uint8_t>(&create_info, 0x26) = 6; // game speed
 		offset<uint8_t>(&create_info, 0x27) = 1; // game state?
 		offset<uint32_t>(&create_info, 0x28) = game_type; // game type (melee)
 		offset<uint16_t>(&create_info, 0x30) = g_tileset;
 
-		int& game_speed = *(int*)0x6CDFD4;
-
-		game_speed = 6;
 		offset<uint32_t>(&create_info, 0x6d) = game_type; // game type (melee)
 		offset<uint16_t>(&create_info, 0x71) = 0;
 		offset<uint16_t>(&create_info, 0x73) = 0;
@@ -346,13 +367,11 @@ void run() {
 		char stat_string[128];
 		make_stat_string(stat_string, create_info.data() + 0x1c, 128);
 
-		log("stat string '%s'\n", escape_nonprintable(stat_string));
+		//log("stat string \"%s\"\n", escape_nonprintable(stat_string));
 
 		void* net_create_info = create_info.data() + 0x6d;
 
 		uint32_t mode_flags = get_mode_flags(net_create_info);
-
-		log("mode_flags %x\n", mode_flags);
 
 		int(__stdcall*SNetCreateLadderGame)(const char* game_name, const char* password, const char* stat, uint32_t game_type, uint32_t ladder_type, uint32_t mode_flags, void* net_create_info, size_t net_create_info_size, int players, const char* host_player_name, const char*, int* player_id);
 		(void*&)SNetCreateLadderGame = (void*)0x410118;
@@ -366,6 +385,8 @@ void run() {
 		g_is_host = 1;
 
 	} else {
+
+		log("searching for games to join");
 
 		void* join_game_data = nullptr;
 		while (true) {
@@ -381,10 +402,9 @@ void run() {
 
 			Sleep(100);
 		}
+		log("\n");
 
-		log("game mode is %d\n", g_game_mode);
-
-		log("joining game '%s' on map '%s'\n", (char*)join_game_data + 4, (char*)join_game_data + 0x4d);
+		log("joining game '%s' on map '%s'\n", remove_nonprintable((char*)join_game_data + 4), remove_nonprintable((char*)join_game_data + 0x4d));
 
 		if (!JoinNetworkGame(join_game_data)) {
 			fatal_error("JoinNetworkGame failed");
@@ -397,37 +417,62 @@ void run() {
 		else fatal_error("failed to join game");
 	}
 
-	log("game mode is %d\n", *(int*)0x596904);
-
-	int race = 2; // 0 zerg, 1 terran, 2 protoss, 6 random
-
 	int& local_nation_id = *(int*)0x512684;
 	bool race_changed = false;
+	bool started = false;
 
+
+	DWORD last_map_transfer_message = GetTickCount();
 	while (true) {
 
 		// For BWAPI clients.
 		dialog_layer_update_func(nullptr, nullptr);
 
 		int r = ((int(__stdcall*)(int))0x4D4340)(0); // LobbyLoopCnt
-		if (r != 81) log("r %d\n", r);
+		if (r != 81 && r != 83) {
+			if (r == 79) {
+				DWORD now = GetTickCount();
+				if (now - last_map_transfer_message >= 5000) {
+					log("map download progress:");
+					last_map_transfer_message = now;
+					for (int i = 0; i < 8; ++i) {
+						int* percent = (int*)0x68F4FC;
+						if (percent[i]) log(" %d%%", percent[i]);
+					}
+					log("\n");
+				}
+			} else log("r %d\n", r);
+		}
 
 		if (local_nation_id != -1 && !race_changed) {
 			race_changed = true;
 			change_race(race, local_nation_id);
-			log("race changed\n");
+			log("race changed to %d\n", race);
 
-			const char* cstr = "hello world";
-			__asm {
-				mov edi, cstr;
-				mov edx, 0x4707D0;
-				call edx;
-			}
+// 			const char* cstr = "hello world";
+// 			__asm {
+// 				mov edi, cstr;
+// 				mov edx, 0x4707D0;
+// 				call edx;
+// 			}
 		}
 
 		if (r == 83) break;
 
 		if (r == 81) Sleep(1);
+
+		if (g_is_host && !started) {
+			void* players_struct = (char*)g_players;
+			int occupied_count = 0;
+			for (size_t i = 0; i < 12; ++i) {
+				int type = offset<uint8_t>(players_struct, 0x24 * i + 8);
+				if (type == 2) ++occupied_count;
+			}
+			if (occupied_count >= 2) {
+				started = ((bool(*)())0x452460)();
+				if (started) log("starting game\n");
+			}
+		}
 	}
 
 	int& game_mode = *(int*)0x596904;
@@ -449,7 +494,6 @@ void run() {
 	}
 	((void(*)())0x4CE440)(); // closeLoadGameFile
 
-
 	*(int*)0x51CE98 = 1; // update_tiles_countdown
 
 	int& game_state = *(int*)0x6D11EC;
@@ -461,8 +505,8 @@ void run() {
 
 	*(int*)0x6D121C = 0; // mapStarted
 
-	log("local_mask is %d\n", *(int*)0x057F0B0);
-	log("g_LocalNationID is %d\n", *(int*)0x512684);
+	int& game_speed = *(int*)0x6CDFD4;
+	game_speed = offset<uint8_t>(g_game_data, 0x26);
 
 	newGame(1);
 
@@ -482,6 +526,8 @@ void run() {
 
 	*(int*)0x51CEA0 = 1; // currentSpeedLatFrameCount
 	*(char*)0x51CE9D = 0; // wantMoreTurns
+
+	if (game_state) log("game started\n");
 
 	while (game_state) {
 
@@ -686,6 +732,8 @@ int main() {
 		
 		AttachConsole(ATTACH_PARENT_PROCESS);
 
+		log("attached\n");
+
 		HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, main_thread_id);
 
 		init();
@@ -696,6 +744,8 @@ int main() {
 
 	} else {
 
+		std::string exe_path = "StarCraft.exe";
+
 		SetConsoleCtrlHandler([](DWORD type) {
 			if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
 				if (handle_process != INVALID_HANDLE_VALUE) TerminateProcess(handle_process, (UINT)-1);
@@ -703,14 +753,13 @@ int main() {
 			return FALSE;
 		}, TRUE);
 
-		bool do_inject = false;
+		bool do_inject = true;
 
 		if (!do_inject) {
 
 			void* base = (void*)0x400000;
 
 			size_t size = 1024 * 1024 * 3; // starcraft image is slightly less than 3MB
-
 
 			char* b = image_buffer;
 			char* e = b + sizeof(image_buffer);
@@ -722,16 +771,7 @@ int main() {
 
 			pe_info pi;
 
-			const char* path = "Starcraft_multiinstance.exe";
-
-			module_filename.resize(0x100);
-			DWORD full_path_len = GetFullPathNameA(path, module_filename.size(), (char*)module_filename.data(), nullptr);
-			if (full_path_len > module_filename.size()) {
-				module_filename.resize(full_path_len);
-				full_path_len = GetFullPathNameA(path, module_filename.size(), (char*)module_filename.data(), nullptr);
-			}
-			module_filename.resize(full_path_len);
-			if (module_filename.empty()) module_filename = path;
+			module_filename = get_full_pathname(exe_path);
 
 			std::string directory = module_filename;
 			const char* directory_last_slash = strrchr(directory.c_str(), '\\');
@@ -775,7 +815,7 @@ int main() {
 
 			}
 
-			bool load_r = load_pe(path, &pi, true, loaded_modules);
+			bool load_r = load_pe(module_filename.c_str(), &pi, true, loaded_modules);
 
 			if (load_r) {
 				init();
@@ -801,8 +841,7 @@ int main() {
 			memset(&si, 0, sizeof(si));
 			si.cb = sizeof(si);
 
-			std::string cmd = "Starcraft_multiinstance.exe";
-			//std::string cmd = "Starcraft.exe";
+			std::string cmd = exe_path;
 			std::string dir = ".";
 			if (!CreateProcessA(0, (LPSTR)cmd.c_str(), 0, 0, TRUE, CREATE_SUSPENDED, 0, dir.c_str(), &si, &pi)) {
 				log("Failed to start '%s'; error %d\n", cmd.c_str(), GetLastError());
