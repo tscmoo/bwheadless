@@ -690,9 +690,20 @@ void _signal_pre(hook_struct* e, hook_function* _f) {
 	e->calloriginal = false;
 }
 
+std::vector<std::string> opt_dlls;
+
 void init() {
 
-	log("load bwapi: %p\n", LoadLibraryA("BWAPI.dll"));
+	for (auto& v : opt_dlls) {
+		log("loading %s...", v);
+		HMODULE hm = LoadLibraryA(v.c_str());
+		if (hm) log(" success\n");
+		else {
+			log(" error %d\n", GetLastError());
+			auto s = format("failed to load '%s'\n", v);
+			fatal_error(s.c_str());
+		}
+	}
 
 	hook((void*)0x4E0AE0, _WinMain_pre, nullptr, HOOK_STDCALL, 4);
 
@@ -731,8 +742,10 @@ int parse_args(int argc, const char** argv) {
 		log("  -n, --name NAME   The player name. Default 'playername'.\n");
 		log("  -g, --game NAME   The game name when hosting. Defaults to the player name.\n");
 		log("  -m, --map FILE    The map to use when hosting.\n");
-		log("  -r, --race RACE   Zerg, Terran, Protoss or random (case insensitive).\n");
+		log("  -r, --race RACE   Zerg, Terran, Protoss or Random (case insensitive).\n");
 		log("                    Can also be the number 0, 1, 2 or 6 respectively.\n");
+		log("  -l, --dll DLL     Load DLL into StarCraft. This option can be\n");
+		log("                    specified multiple times to load multiple dlls.\n");
 	};
 
 	for (int i = 1; i < argc; ++i) {
@@ -741,7 +754,8 @@ int parse_args(int argc, const char** argv) {
 		auto parm = [&]() {
 			++i;
 			if (i >= argc) {
-				log("error: '%s' requires an argument\n", s);
+				log("%s: error: '%s' requires an argument\n", argv[0], s);
+				log("Use --help for more information.\n");
 				failed = true;
 				return "";
 			}
@@ -769,8 +783,11 @@ int parse_args(int argc, const char** argv) {
 		} else if (!strcmp(s, "--help")) {
 			usage();
 			return -1;
+		} else if (!strcmp(s, "--dll") || !strcmp(s, "-l")) {
+			opt_dlls.push_back(parm());
 		} else {
-			log("invalid argument '%s'\n", s);
+			log("%s: error: invalid argument '%s'\n", argv[0], s);
+			log("Use --help to see a list of valid arguments.\n");
 			failed = true;
 		}
 		if (failed) return -1;
@@ -779,7 +796,8 @@ int parse_args(int argc, const char** argv) {
 	if (opt_game_name.empty()) opt_game_name = opt_player_name;
 
 	if (opt_host_game && opt_map_fn.empty()) {
-		log("error: You must specify a map (-m filename) when hosting.\n");
+		log("%s: error: You must specify a map (-m filename) when hosting.\n", argv[0]);
+		log("Use --help for more information.\n");
 		return -1;
 	}
 
@@ -791,6 +809,7 @@ int parse_args(int argc, const char** argv) {
 HANDLE handle_process = INVALID_HANDLE_VALUE;
 
 // buffer to ensure the image size is large enough to contain starcraft (at 0x400000)
+// when injecting it is instead used to pass the command line arguments
 char image_buffer[5 * 1024 * 1024];
 
 int main(int argc, const char** argv) {
@@ -816,9 +835,6 @@ int main(int argc, const char** argv) {
 
 		int r = parse_args(argc, argv.data());
 		if (r) fatal_error("parse_args failed");
-
-		if (argv.empty()) memset(image_buffer, 0, sizeof(int));
-		else memset(image_buffer, 0, argv.back() + strlen(argv.back()) - image_buffer + 1);
 
 		HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, main_thread_id);
 
