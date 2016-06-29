@@ -252,7 +252,7 @@ void* g_player_colors = (void*)0x57F21C;
 
 bool opt_host_game = false;
 std::string opt_player_name = "playername";
-std::string opt_game_name = opt_player_name;
+std::string opt_game_name;
 std::string opt_map_fn;
 int opt_race = 6;
 
@@ -775,6 +775,8 @@ int parse_args(int argc, const char** argv) {
 		}
 		if (failed) return -1;
 	}
+
+	if (opt_game_name.empty()) opt_game_name = opt_player_name;
 
 	if (opt_host_game && opt_map_fn.empty()) {
 		log("error: You must specify a map (-m filename) when hosting.\n");
