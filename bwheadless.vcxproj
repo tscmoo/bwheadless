@@ -48,14 +48,13 @@
       <OptimizeReferences>true</OptimizeReferences>
       <EntryPointSymbol>start</EntryPointSymbol>
       <BaseAddress>0x00300000</BaseAddress>
-      <RandomizedBaseAddress>false</RandomizedBaseAddress>
-      <FixedBaseAddress>true</FixedBaseAddress>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="codegen.h" />
     <ClInclude Include="load_pe.h" />
     <ClInclude Include="sc_hook.h" />
+    <ClInclude Include="strf.h" />
     <ClInclude Include="x86dec.h" />
   </ItemGroup>
   <ItemGroup>
