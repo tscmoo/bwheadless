@@ -27,26 +27,26 @@ void take_image() {
 
 	// ...to find last section
 	DWORD begin = (DWORD)p;
-	DWORD end = begin + section[n_sections-1].VirtualAddress + section[n_sections-1].Misc.VirtualSize;
-	image_size=end-begin;
+	DWORD end = begin + section[n_sections - 1].VirtualAddress + section[n_sections - 1].Misc.VirtualSize;
+	image_size = end - begin;
 
 	// any memory allocation function that does not use the CRT will do (that excludes malloc)
-	image_mem=(char*)VirtualAlloc(0,image_size,MEM_RESERVE | MEM_COMMIT,PAGE_READWRITE);
+	image_mem = (char*)VirtualAlloc(0, image_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 	// copy all the memory from the beginning of the module to the end of the last section
-	memcpy(image_mem,(void*)begin,image_size);
+	memcpy(image_mem, (void*)begin, image_size);
 }
 
 // copy from src in this process to dst in the image
 // use to set a variable or memory area in the image before injection
 
-void image_set(const void*dst,const void*src,size_t size) {
+void image_set(const void*dst, const void*src, size_t size) {
 	DWORD offset = (DWORD)dst - ((DWORD)hmodule);
-	memcpy(image_mem + offset,src,size);
+	memcpy(image_mem + offset, src, size);
 }
 
 // easy way to "copy" a variable or memory area over to the image
-void image_copy(const void*p,size_t size) {
-	image_set(p,p,size);
+void image_copy(const void*p, size_t size) {
+	image_set(p, p, size);
 }
 
 // this goes through the Import Address Table and loads all the imports
@@ -57,18 +57,18 @@ void do_iat() {
 	const char*p = (const char*)hmodule;
 	PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)p;
 	PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(p + dos->e_lfanew);
-	PIMAGE_IMPORT_DESCRIPTOR import = (PIMAGE_IMPORT_DESCRIPTOR) (p + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+	PIMAGE_IMPORT_DESCRIPTOR import = (PIMAGE_IMPORT_DESCRIPTOR)(p + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
 	while (import->Characteristics) {
-		HMODULE hm = LoadLibraryA(p+import->Name);
+		HMODULE hm = LoadLibraryA(p + import->Name);
 		if (hm) {
-			DWORD*dw = (DWORD*)(p+import->OriginalFirstThunk);
+			DWORD*dw = (DWORD*)(p + import->OriginalFirstThunk);
 			int i;
-			for (i=0;*dw;i++) {
+			for (i = 0; *dw; i++) {
 				FARPROC proc;
-				if (*dw&0x80000000) proc=GetProcAddress(hm,(LPCSTR)(*dw&&0xFFFF)); // load by ordinal
-				else proc=GetProcAddress(hm,p+*dw+2); // load by name
+				if (*dw & 0x80000000) proc = GetProcAddress(hm, (LPCSTR)(*dw && 0xFFFF)); // load by ordinal
+				else proc = GetProcAddress(hm, p + *dw + 2); // load by name
 				if (proc) {
-					*((FARPROC*)(p+import->FirstThunk)+i) = proc; // set the value in the bound IAT
+					*((FARPROC*)(p + import->FirstThunk) + i) = proc; // set the value in the bound IAT
 				} else {
 					// failed to load proc
 				}
@@ -87,7 +87,7 @@ void do_iat() {
 #ifdef __cplusplus
 extern "C"
 #endif
-	void mainCRTStartup();
+void mainCRTStartup();
 #ifdef __cplusplus
 extern "C"
 #endif
@@ -111,7 +111,12 @@ void injected_start() {
 	mainCRTStartup();
 }
 
-void* inject(HANDLE h_proc, bool create_remote_thread) {
+struct inject_info {
+	void* base = nullptr;
+	void* entry = nullptr;
+};
+
+inject_info inject(HANDLE h_proc, bool create_remote_thread) {
 
 	char*p = (char*)hmodule;
 	PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)p;
@@ -120,23 +125,24 @@ void* inject(HANDLE h_proc, bool create_remote_thread) {
 	DWORD begin = (DWORD)p;
 	DWORD end = begin + image_size;
 	int start_offset = (ptrdiff_t)&injected_start - begin; // offset of the entry point for the injected code
-	// allocate memory in the target process for the image
-	char*mem=(char*)VirtualAllocEx(h_proc,0,image_size,MEM_COMMIT,PAGE_EXECUTE_READWRITE);
+														   // allocate memory in the target process for the image
+	char*mem = (char*)VirtualAllocEx(h_proc, 0, image_size, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
 	if (!mem) {
-		fprintf(stderr,"VirtualAllocEx failed; error %d",GetLastError());
-		return nullptr;
+		printf("VirtualAllocEx failed; error %d\n", GetLastError());
+		fflush(stdout);
+		return {};
 	}
 
 	// calling GetModuleHandle(0) from the injected code would return the module of the target process,
 	// so we set hmodule in the image to the target memory here
-	image_set(&hmodule,&mem,sizeof(hmodule));
+	image_set(&hmodule, &mem, sizeof(hmodule));
 
 	// now we must do base relocation, since we are probably loading the code in a different memory area then where we took the image from :)
 	// this is essentially the same thing Windows does whenever loading a module in a different location than it's desired base address
 	// the executable must be linked with a relocation section, otherwise it will crash bad after injecting
 
 	char*tmp_mem = (char*)malloc(image_size);
-	memcpy(tmp_mem,image_mem,image_size);
+	memcpy(tmp_mem, image_mem, image_size);
 
 	{
 		// the relocation section is basically a list of IMAGE_BASE_RELOCATION entries
@@ -145,15 +151,15 @@ void* inject(HANDLE h_proc, bool create_remote_thread) {
 		// (for x86, all base relocations are of type IMAGE_REL_BASED_HIGHLOW)
 		// each offset should be added to the virtual address of the IMAGE_BASE_RELOCATION to get the address of a DWORD
 		// subtract begin from that DWORD and add mem, and the relocation is done
-		PIMAGE_BASE_RELOCATION reloc = (PIMAGE_BASE_RELOCATION) (p + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
+		PIMAGE_BASE_RELOCATION reloc = (PIMAGE_BASE_RELOCATION)(p + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
 		while (reloc->VirtualAddress) {
 			DWORD d = (DWORD)(p + reloc->VirtualAddress);
 			PIMAGE_BASE_RELOCATION next = (PIMAGE_BASE_RELOCATION)((char*)reloc + reloc->SizeOfBlock);
-			WORD*w = (WORD*)(reloc+1);
-			while ((char*)w<(char*)next) {
-				if (*w>>12 == IMAGE_REL_BASED_HIGHLOW) {
-					DWORD d2 = d + (*w&0xFFF);
-					if (d2>=begin&&d2<end) {
+			WORD*w = (WORD*)(reloc + 1);
+			while ((char*)w < (char*)next) {
+				if (*w >> 12 == IMAGE_REL_BASED_HIGHLOW) {
+					DWORD d2 = d + (*w & 0xFFF);
+					if (d2 >= begin&&d2 < end) {
 						DWORD*d = (DWORD*)(d2 - begin + (DWORD)tmp_mem);
 						*d -= begin - (DWORD)mem;
 					}
@@ -165,25 +171,29 @@ void* inject(HANDLE h_proc, bool create_remote_thread) {
 	}
 
 	// write it into the allocated memory in the target process!
-	if (!WriteProcessMemory(h_proc,mem,tmp_mem,image_size,0)) {
-		fprintf(stderr,"WriteProcessMemory failed; %d",GetLastError());
+	if (!WriteProcessMemory(h_proc, mem, tmp_mem, image_size, nullptr)) {
+		printf("WriteProcessMemory failed; %d", GetLastError());
+		fflush(stdout);
 		free(tmp_mem);
-		return nullptr;
+		return {};
 	}
 	free(tmp_mem);
 
 	if (create_remote_thread) {
 		// create the remote thread...
-		HANDLE h=CreateRemoteThread(h_proc,NULL,0,(LPTHREAD_START_ROUTINE)(mem+start_offset),0,0,0);
+		HANDLE h = CreateRemoteThread(h_proc, NULL, 0, (LPTHREAD_START_ROUTINE)(mem + start_offset), 0, 0, 0);
 		if (!h) {
-			fprintf(stderr,"CreateRemoteThread failed; error %d",GetLastError());
-			return nullptr;
+			printf("CreateRemoteThread failed; error %d", GetLastError());
+			fflush(stdout);
+			return {};
 		}
 		CloseHandle(h);
 		// ...and the rest is up to fate
 	}
-
-	return mem + start_offset;
+	inject_info r;
+	r.base = mem;
+	r.entry = mem + start_offset;
+	return r;
 }
 
 
