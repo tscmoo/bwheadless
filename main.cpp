@@ -28,17 +28,6 @@ void log(const char*fmt, T&&...args) {
 	WriteFile(output_handle, s.data(), s.size(), &written, nullptr);
 }
 
-void* inject(HANDLE h_proc, bool create_remote_thread);
-void image_set(const void*dst, const void*src, size_t size);
-extern int is_injected;
-extern HMODULE hmodule;
-DWORD main_thread_id;
-
-template<typename T>
-void image_set(T& dst, const T& src) {
-	image_set(&dst, &src, sizeof(T));
-}
-
 void fatal_error(const char* desc) {
 	log("fatal error: %s\n", desc);
 	TerminateProcess(GetCurrentProcess(), (UINT)-1);
@@ -314,8 +303,6 @@ void run() {
 		uint16_t& map_tile_height = *(uint16_t*)0x57F1D6;
 
 		//log("scenario name: '%s'  description: '%s'\n", remove_nonprintable(scenario_name).c_str(), remove_nonprintable(scenario_description).c_str());
-		log("scenario name: '%s'\n", remove_nonprintable(scenario_name).c_str());
-		log("size %d %d\n", map_tile_width, map_tile_height);
 
 		void* players_struct = (void*)0x59BDB0;
 		int players_count = 0;
@@ -324,7 +311,7 @@ void run() {
 			if (type == 2 || type == 6) ++players_count;
 		}
 
-		log("%d players\n", players_count);
+		log("scenario name: '%s', size %dx%d, %d players\n", remove_nonprintable(scenario_name).c_str(), map_tile_width, map_tile_height, players_count);
 
 		std::array<uint8_t, 0x8d> create_info {};
 
@@ -383,6 +370,8 @@ void run() {
 
 		memcpy(g_game_data, create_info.data(), create_info.size());
 		g_is_host = 1;
+
+		log("game hosted\n");
 
 	} else {
 
@@ -690,6 +679,14 @@ void _signal_pre(hook_struct* e, hook_function* _f) {
 	e->calloriginal = false;
 }
 
+// This function does some integrity checks on maps, however it requires
+// FindResource to work on the process module, so it does not work when
+// we are not injecting. Thus we just remove the function.
+void _CHK_VCOD_pre(hook_struct* e, hook_function* _f) {
+	e->calloriginal = false;
+	e->retval = 1;
+}
+
 std::vector<std::string> opt_dlls;
 
 void init() {
@@ -725,7 +722,39 @@ void init() {
 
 	hook((void*)0x40C8D5, _signal_pre, nullptr, HOOK_CDECL, 2);
 
+	hook((void*)0x4CBC40, _CHK_VCOD_pre, nullptr, HOOK_STDCALL, 3);
+
 }
+
+#include "load_pe.h"
+
+void(*sc_entry)();
+void injected_start();
+void _start_pre(hook_struct* e, hook_function* _f) {
+	sc_entry = (void(*)())_f->entry;
+	injected_start();
+}
+
+struct inject_info {
+	void* base = nullptr;
+	void* entry = nullptr;
+};
+inject_info inject(HANDLE h_proc, bool create_remote_thread);
+void image_set(const void*dst, const void*src, size_t size);
+extern int is_injected;
+extern HMODULE hmodule;
+
+template<typename T>
+void image_set(T& dst, const T& src) {
+	image_set(&dst, &src, sizeof(T));
+}
+
+HANDLE handle_process = INVALID_HANDLE_VALUE;
+
+// buffer to ensure the image size is large enough to contain starcraft (at 0x400000)
+// when injecting it is instead used to pass the command line arguments
+char image_buffer[5 * 1024 * 1024];
+
 
 std::string exe_path = "StarCraft.exe";
 
@@ -804,173 +833,182 @@ int parse_args(int argc, const char** argv) {
 	return 0;
 }
 
-#include "load_pe.h"
-
-HANDLE handle_process = INVALID_HANDLE_VALUE;
-
-// buffer to ensure the image size is large enough to contain starcraft (at 0x400000)
-// when injecting it is instead used to pass the command line arguments
-char image_buffer[5 * 1024 * 1024];
-
 int main(int argc, const char** argv) {
 
-	output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+	try {
 
-	if (is_injected) {
-		
-		AttachConsole(ATTACH_PARENT_PROCESS);
+		output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
 
-		log("attached\n");
+		if (is_injected) {
 
-		int argc = 0;
-		std::vector<const char*> argv;
+			AttachConsole(ATTACH_PARENT_PROCESS);
 
-		const char* src = image_buffer;
-		argc = *(int*)src;
-		src += sizeof(int);
-		for (int i = 0; i < argc; ++i) {
-			argv.push_back(src);
-			src += strlen(src) + 1;
-		}
+			log("attached\n");
 
-		int r = parse_args(argc, argv.data());
-		if (r) fatal_error("parse_args failed");
+			int argc = 0;
+			std::vector<const char*> argv;
 
-		HANDLE h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, main_thread_id);
-
-		init();
-
-		ResumeThread(h);
-
-		ExitThread(0);
-
-	} else {
-
-		int r = parse_args(argc, argv);
-		if (r) return r;
-
-		SetConsoleCtrlHandler([](DWORD type) {
-			if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
-				if (handle_process != INVALID_HANDLE_VALUE) TerminateProcess(handle_process, (UINT)-1);
-			}
-			return FALSE;
-		}, TRUE);
-
-		bool do_inject = true;
-
-		if (!do_inject) {
-
-			void* base = (void*)0x400000;
-
-			size_t size = 1024 * 1024 * 3; // starcraft image is slightly less than 3MB
-
-			char* b = image_buffer;
-			char* e = b + sizeof(image_buffer);
-			if ((char*)base < b || (char*)base >= e || (char*)base + size < b || (char*)base + size >= e) {
-				log("error: image_buffer is [%p,%p), which does not contain [%p,%p).\n", b, e, base, (char*)base + size);
-				log("This image must be linked with base address 0x300000 and relocations stripped.\n");
-				return -1;
+			const char* src = image_buffer;
+			argc = *(int*)src;
+			src += sizeof(int);
+			for (int i = 0; i < argc; ++i) {
+				argv.push_back(src);
+				src += strlen(src) + 1;
 			}
 
-			pe_info pi;
+			int r = parse_args(argc, argv.data());
+			if (r) fatal_error("parse_args failed");
 
-			module_filename = get_full_pathname(exe_path);
+			init();
 
-			std::string directory = module_filename;
-			const char* directory_last_slash = strrchr(directory.c_str(), '\\');
-			if (directory_last_slash) {
-				directory.resize(directory_last_slash - directory.data());
-				SetCurrentDirectoryA(directory.c_str());
-			}
+			sc_entry();
+			ExitThread(0);
 
-			HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+		} else {
 
-			hook(GetProcAddress(kernel32, "GetModuleHandleA"), _GetModuleHandleA_pre, nullptr, HOOK_STDCALL, 1);
-			hook(GetProcAddress(kernel32, "GetModuleFileNameA"), _GetModuleFileNameA_pre, nullptr, HOOK_STDCALL, 3);
+			int r = parse_args(argc, argv);
+			if (r) return r;
 
-			// storm.dll fails to work if it is dynamically loaded. It detects this
-			// using the lpvReserved parameter of DllEntryPoint.
-			// The easy fix it to just set *(void*)(storm.dll + 0x5E5E4) to null
-			// after loading it. The other option is to manually load storm.dll
-			// and call DllEntryPoint with the "correct" parameters, but then BWAPI
-			// fails to work unless we redirect LoadLibrary/GetModuleHandle and 
-			// implement GetProcAddress (GetProcAddress is not implemented, so
-			// BWAPI will not work if this is set to true).
-			// Could also just statically link to storm.dll, but I'd rather not
-			// have the dependency.
-			bool load_storm_manually = false;
+			SetConsoleCtrlHandler([](DWORD type) {
+				if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
+					if (handle_process != INVALID_HANDLE_VALUE) TerminateProcess(handle_process, (UINT)-1);
+					TerminateProcess(GetCurrentProcess(), (UINT)-1);
+				}
+				return FALSE;
+			}, TRUE);
 
-			std::map<std::string, HMODULE> loaded_modules;
+			bool do_inject = true;
 
-			if (load_storm_manually) {
-				pe_info storm_pi;
+			if (!do_inject) {
 
-				if (!load_pe("storm.dll", &storm_pi, false)) {
-					log("failed to load storm.dll\n");
+				void* base = (void*)0x400000;
+
+				size_t size = 1024 * 1024 * 3; // starcraft image is slightly less than 3MB
+
+				char* b = image_buffer;
+				char* e = b + sizeof(image_buffer);
+				if ((char*)base < b || (char*)base >= e || (char*)base + size < b || (char*)base + size >= e) {
+					log("error: image_buffer is [%p,%p), which does not contain [%p,%p).\n", b, e, base, (char*)base + size);
+					log("This image must be linked with base address 0x300000 and relocations stripped.\n");
 					return -1;
 				}
 
-				BOOL r = ((BOOL(__stdcall*)(HINSTANCE, DWORD, LPVOID))storm_pi.entry)((HINSTANCE)storm_pi.base, DLL_PROCESS_ATTACH, (void*)1);
-				if (!r) log("warning: storm.dll DllEntryPoint returned false\n");
+				pe_info pi;
 
-				storm_module = storm_pi.base;
-				loaded_modules["storm.dll"] = (HMODULE)storm_pi.base;
+				module_filename = get_full_pathname(exe_path);
 
-			}
-
-			bool load_r = load_pe(module_filename.c_str(), &pi, true, loaded_modules);
-
-			if (load_r) {
-				init();
-
-				if (!load_storm_manually) {
-					*(void**)((char*)GetModuleHandleA("storm.dll") + 0x5E5E4) = nullptr;
+				std::string directory = module_filename;
+				const char* directory_last_slash = strrchr(directory.c_str(), '\\');
+				if (directory_last_slash) {
+					directory.resize(directory_last_slash - directory.data());
+					SetCurrentDirectoryA(directory.c_str());
 				}
 
-				((void(*)())pi.entry)();
+				HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
 
-				log("entry returned\n");
+				hook(GetProcAddress(kernel32, "GetModuleHandleA"), _GetModuleHandleA_pre, nullptr, HOOK_STDCALL, 1);
+				hook(GetProcAddress(kernel32, "GetModuleFileNameA"), _GetModuleFileNameA_pre, nullptr, HOOK_STDCALL, 3);
+
+				// storm.dll fails to work if it is dynamically loaded. It detects this
+				// using the lpvReserved parameter of DllEntryPoint.
+				// The easy fix it to just set *(void*)(storm.dll + 0x5E5E4) to null
+				// after loading it. The other option is to manually load storm.dll
+				// and call DllEntryPoint with the "correct" parameters, but then BWAPI
+				// fails to work unless we redirect LoadLibrary/GetModuleHandle and 
+				// implement GetProcAddress (GetProcAddress is not implemented, so
+				// BWAPI will not work if this is set to true).
+				// Could also just statically link to storm.dll, but I'd rather not
+				// have the dependency.
+				bool load_storm_manually = false;
+
+				std::map<std::string, HMODULE> loaded_modules;
+
+				if (load_storm_manually) {
+					pe_info storm_pi;
+
+					if (!load_pe("storm.dll", &storm_pi, false)) {
+						log("failed to load storm.dll\n");
+						return -1;
+					}
+
+					BOOL r = ((BOOL(__stdcall*)(HINSTANCE, DWORD, LPVOID))storm_pi.entry)((HINSTANCE)storm_pi.base, DLL_PROCESS_ATTACH, (void*)1);
+					if (!r) log("warning: storm.dll DllEntryPoint returned false\n");
+
+					storm_module = storm_pi.base;
+					loaded_modules["storm.dll"] = (HMODULE)storm_pi.base;
+
+				}
+
+				bool load_r = load_pe(module_filename.c_str(), &pi, true, loaded_modules);
+
+				if (load_r) {
+					init();
+
+					if (!load_storm_manually) {
+						*(void**)((char*)GetModuleHandleA("storm.dll") + 0x5E5E4) = nullptr;
+					}
+
+					log("loaded\n");
+
+					((void(*)())pi.entry)();
+
+					log("entry returned\n");
+
+				} else {
+					log("failed to load\n");
+				}
+
+				return 0;
+
 
 			} else {
-				log("failed to load\n");
+				STARTUPINFOA si;
+				PROCESS_INFORMATION pi;
+				memset(&si, 0, sizeof(si));
+				si.cb = sizeof(si);
+
+				std::string cmd = exe_path;
+				std::string dir = ".";
+				if (!CreateProcessA(0, (LPSTR)cmd.c_str(), 0, 0, TRUE, CREATE_SUSPENDED, 0, dir.c_str(), &si, &pi)) {
+					log("Failed to start '%s'; error %d\n", cmd.c_str(), GetLastError());
+					return -1;
+				}
+				try {
+
+					handle_process = pi.hProcess;
+
+					char* dst = image_buffer;
+					image_set(*(int*)dst, argc);
+					dst += sizeof(int);
+					for (int i = 0; i < argc; ++i) {
+						size_t len = strlen(argv[i]) + 1;
+						if (dst + len >= (char*)image_buffer + sizeof(image_buffer)) fatal_error("not enough space for parameters");
+						image_set(dst, argv[i], len);
+						dst += len;
+					}
+					*dst = 0;
+
+					auto i = inject(pi.hProcess, false);
+					if (!i.base) {
+						throw std::runtime_error("inject failed");
+					}
+
+					hook_remote(pi.hProcess, (void*)0x404C21, (hook_proc)((uint8_t*)_start_pre - (uint8_t*)hmodule + (uint8_t*)i.base), nullptr, HOOK_CDECL, 0);
+
+					ResumeThread(pi.hThread);
+
+					WaitForSingleObject(pi.hProcess, INFINITE);
+
+				} catch (...) {
+					TerminateProcess(pi.hProcess, -1);
+					throw;
+				}
 			}
 
-			return 0;
-
-
-		} else {
-			STARTUPINFOA si;
-			PROCESS_INFORMATION pi;
-			memset(&si, 0, sizeof(si));
-			si.cb = sizeof(si);
-
-			std::string cmd = exe_path;
-			std::string dir = ".";
-			if (!CreateProcessA(0, (LPSTR)cmd.c_str(), 0, 0, TRUE, CREATE_SUSPENDED, 0, dir.c_str(), &si, &pi)) {
-				log("Failed to start '%s'; error %d\n", cmd.c_str(), GetLastError());
-				return -1;
-			}
-
-			handle_process = pi.hProcess;
-
-			char* dst = image_buffer;
-			image_set(*(int*)dst, argc);
-			dst += sizeof(int);
-			for (int i = 0; i < argc; ++i) {
-				size_t len = strlen(argv[i]) + 1;
-				if (dst + len >= (char*)image_buffer + sizeof(image_buffer)) fatal_error("not enough space for parameters");
-				image_set(dst, argv[i], len);
-				dst += len;
-			}
-			*dst = 0;
-
-			image_set(main_thread_id, pi.dwThreadId);
-			inject(pi.hProcess, true);
-
-			WaitForSingleObject(pi.hProcess, INFINITE);
 		}
 
+	} catch (const std::exception& e) {
+		fatal_error(e.what());
 	}
-
 }
 
