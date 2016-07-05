@@ -7,6 +7,9 @@
 #include <array>
 #include <vector>
 #include <map>
+#include <thread>
+#include <atomic>
+#include <mutex>
 
 #include "sc_hook.h"
 
@@ -638,7 +641,7 @@ void _GetModuleHandleA_pre(hook_struct* e, hook_function* _f) {
 		e->calloriginal = false;
 		e->retval = 0x400000;
 	} else if (storm_module) {
-		// Would need to implement GetProcAddress for this.
+		// Would need to implement GetProcAddress for this. (only needed for load_storm_manually)
 // 		if (!_stricmp((char*)e->arg[0], "storm.dll") || !_stricmp((char*)e->arg[0], "storm")) {
 // 			e->calloriginal = false;
 // 			e->retval = (DWORD)storm_module;
@@ -647,6 +650,7 @@ void _GetModuleHandleA_pre(hook_struct* e, hook_function* _f) {
 }
 
 std::string module_filename;
+std::string module_directory;
 // BWAPI checks the version of the executable, so this hook is needed
 // to make it check the correct file.
 // It's also used by BW to locate data files, so without this the executable
@@ -687,9 +691,74 @@ void _CHK_VCOD_pre(hook_struct* e, hook_function* _f) {
 	e->retval = 1;
 }
 
+struct ConnectNamedPipe_thread_info {
+	std::atomic<int> state;
+	BOOL retval;
+	DWORD last_error;
+	std::thread t;
+};
+std::map<HANDLE, ConnectNamedPipe_thread_info> ConnectNamedPipe_ti;
+std::mutex ConnectNamedPipe_mut;
+// Wine does not respect PIPE_NOWAIT in ConnectNamedPipe, which causes
+// BWAPI to hang. We fix that here.
+void _ConnectNamedPipe_pre(hook_struct* e, hook_function* _f) {
+	std::lock_guard<std::mutex> l(ConnectNamedPipe_mut);
+	for (auto& v : ConnectNamedPipe_ti) {
+		if (v.second.t.get_id() == std::this_thread::get_id()) return;
+	}
+	HANDLE h = (HANDLE)e->arg[0];
+	DWORD pipe_state = 0;
+	if (GetNamedPipeHandleStateW(h, &pipe_state, nullptr, nullptr, nullptr, nullptr, 0)) {
+		if (pipe_state & PIPE_NOWAIT) {
+			e->calloriginal = false;
+			auto& i = ConnectNamedPipe_ti[h];
+			if (i.state == 2) {
+				i.state = 0;
+				e->retval = i.retval;
+				SetLastError(i.last_error);
+			} else {
+				if (i.state == 0) {
+					i.state = 1;
+					if (i.t.joinable()) i.t.join();
+					i.t = std::thread([h, i = &i, _f]() {
+						i->retval = ConnectNamedPipe(h, nullptr);
+						i->last_error = GetLastError();
+						i->state = 2;
+					});
+				}
+				e->retval = 0;
+				SetLastError(ERROR_PIPE_LISTENING);
+			}
+		}
+	}
+}
+
+// BWAPI reads StarCraft's InstallPath from the registry to locate bwapi.ini.
+// The fallback path is blank, which it appends a slash to, so we provide a
+// better fallback here.
+void _SRegLoadString_post(hook_struct* e, hook_function* _f) {
+	if (!e->retval && !strcmp((const char*)e->arg[1], "InstallPath")) {
+		char* dst = (char*)e->arg[3];
+		size_t size = (size_t)e->arg[4];
+		if (size >= module_directory.size() + 1) memcpy(dst, module_directory.data(), module_directory.size() + 1);
+		else {
+			if (size) {
+				memcpy(dst, module_directory.data(), size - 1);
+				dst[size - 1] = 0;
+			}
+		}
+	}
+}
+
 std::vector<std::string> opt_dlls;
 
 void init() {
+
+	HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+	hook(GetProcAddress(kernel32, "ConnectNamedPipe"), _ConnectNamedPipe_pre, nullptr, HOOK_STDCALL, 2);
+
+	HMODULE storm = GetModuleHandleA("storm.dll");
+	hook(GetProcAddress(storm, (char*)422), nullptr, _SRegLoadString_post, HOOK_STDCALL, 5);
 
 	for (auto& v : opt_dlls) {
 		log("loading %s...", v);
@@ -728,13 +797,6 @@ void init() {
 
 #include "load_pe.h"
 
-void(*sc_entry)();
-void injected_start();
-void _start_pre(hook_struct* e, hook_function* _f) {
-	sc_entry = (void(*)())_f->entry;
-	injected_start();
-}
-
 struct inject_info {
 	void* base = nullptr;
 	void* entry = nullptr;
@@ -743,10 +805,19 @@ inject_info inject(HANDLE h_proc, bool create_remote_thread);
 void image_set(const void*dst, const void*src, size_t size);
 extern int is_injected;
 extern HMODULE hmodule;
+void import_kernel32(HMODULE from_hm, HMODULE to_hm);
 
 template<typename T>
 void image_set(T& dst, const T& src) {
 	image_set(&dst, &src, sizeof(T));
+}
+
+void(*sc_entry)();
+void injected_start();
+void _start_pre(hook_struct* e, hook_function* _f) {
+	import_kernel32((HMODULE)0x400000, hmodule);
+	sc_entry = (void(*)())_f->entry;
+	injected_start();
 }
 
 HANDLE handle_process = INVALID_HANDLE_VALUE;
@@ -845,6 +916,16 @@ int main(int argc, const char** argv) {
 
 			log("attached\n");
 
+			module_filename = get_full_pathname(exe_path);
+
+			std::string directory = module_filename;
+			const char* directory_last_slash = strrchr(directory.c_str(), '\\');
+			if (directory_last_slash) {
+				directory.resize(directory_last_slash - directory.data());
+				SetCurrentDirectoryA(directory.c_str());
+			}
+			module_directory = directory;
+
 			int argc = 0;
 			std::vector<const char*> argv;
 
@@ -903,6 +984,7 @@ int main(int argc, const char** argv) {
 					directory.resize(directory_last_slash - directory.data());
 					SetCurrentDirectoryA(directory.c_str());
 				}
+				module_directory = directory;
 
 				HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
 

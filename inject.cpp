@@ -111,6 +111,58 @@ void injected_start() {
 	mainCRTStartup();
 }
 
+// This function resolves imports from kernel32 in to_hm by locating
+// GetModuleHandleA and GetProcAddress from the imports of from_hm.
+// Usually unnecessary, but under Wine the address of kernel32 is
+// variable.
+void import_kernel32(HMODULE from_hm, HMODULE to_hm) {
+	const char* p = (const char*)from_hm;
+	PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)p;
+	PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(p + dos->e_lfanew);
+	PIMAGE_IMPORT_DESCRIPTOR import = (PIMAGE_IMPORT_DESCRIPTOR)(p + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+
+	HMODULE (__stdcall*local_GetModuleHandleA)(const char*) = nullptr;
+	FARPROC (__stdcall*local_GetProcAddress)(HMODULE, const char*) = nullptr;
+	for (; import->Characteristics; ++import) {
+		if (!_stricmp(p + import->Name, "kernel32") || !_stricmp(p + import->Name, "kernel32.dll")) {
+			DWORD*dw = (DWORD*)(p + import->OriginalFirstThunk);
+			int i;
+			for (i = 0; *dw; ++i, ++dw) {
+				if (~*dw & 0x80000000) {
+					const char* name = p + *dw + 2;
+					FARPROC proc = *((FARPROC*)(p + import->FirstThunk) + i);
+					if (!strcmp(name, "GetModuleHandleA")) local_GetModuleHandleA = (HMODULE(__stdcall*)(const char*))proc;
+					else if (!strcmp(name, "GetProcAddress")) local_GetProcAddress = (FARPROC(__stdcall*)(HMODULE, const char*))proc;
+				}
+			}
+		}
+	}
+
+	HMODULE kernel32 = local_GetModuleHandleA("kernel32.dll");
+
+	p = (const char*)to_hm;
+	dos = (PIMAGE_DOS_HEADER)p;
+	nt = (PIMAGE_NT_HEADERS)(p + dos->e_lfanew);
+	import = (PIMAGE_IMPORT_DESCRIPTOR)(p + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+
+	for (; import->Characteristics; ++import) {
+		if (!_stricmp(p + import->Name, "kernel32") || !_stricmp(p + import->Name, "kernel32.dll")) {
+			DWORD*dw = (DWORD*)(p + import->OriginalFirstThunk);
+			int i;
+			for (i = 0; *dw; ++i, ++dw) {
+				FARPROC proc;
+				if (*dw & 0x80000000) proc = local_GetProcAddress(kernel32, (LPCSTR)(*dw && 0xFFFF)); // load by ordinal
+				else proc = local_GetProcAddress(kernel32, p + *dw + 2); // load by name
+				if (proc) {
+					*((FARPROC*)(p + import->FirstThunk) + i) = proc; // set the value in the bound IAT
+				} else {
+					// failed to load proc
+				}
+			}
+		}
+	}
+}
+
 struct inject_info {
 	void* base = nullptr;
 	void* entry = nullptr;
