@@ -242,11 +242,15 @@ void* g_game_data = (void*)0x5967F8;
 void* g_players = (void*)0x57EEE0;
 void* g_player_colors = (void*)0x57F21C;
 
+int& g_frame_count = *(int*)0x057F23C;
+
 bool opt_host_game = false;
 std::string opt_player_name = "playername";
 std::string opt_game_name;
 std::string opt_map_fn;
 int opt_race = 6;
+std::string opt_network_provider = "SMEM";
+uint32_t opt_lan_sendto = 0;
 
 void run() {
 
@@ -266,8 +270,13 @@ void run() {
 
 	string_copy((char*)0x57EE9C, player_name, 25); // player name
 
-	// SMEM is local pc
-	if (!InitializeNetworkProvider('SMEM')) {
+	uint32_t provider = 0;
+	for (size_t i = 0; i < opt_network_provider.size() && i < 4; ++i) {
+		uint8_t c = opt_network_provider[opt_network_provider.size() - 1 - i];
+		provider |= (uint32_t)c << (8 * i);
+	}
+	// SMEM is local pc, UDPN is lan (udp)
+	if (!InitializeNetworkProvider(provider)) {
 		fatal_error("InitializeNetworkProvider failed");
 	}
 
@@ -385,6 +394,7 @@ void run() {
 
 			enum_games([&](void* ptr) {
 				//log("game %s\n", (char*)ptr + 4);
+				if (!opt_game_name.empty() && (char*)ptr + 4 != opt_game_name) return;
 				if (!join_game_data) join_game_data = ptr;
 			});
 
@@ -691,6 +701,32 @@ void _CHK_VCOD_pre(hook_struct* e, hook_function* _f) {
 	e->retval = 1;
 }
 
+void _CMD_GameHash_post(hook_struct* e, hook_function* _f) {
+	if (!e->retval) {
+		log("warning: Hash check failed. Game is out of sync.\n");
+		fatal_error("out of sync");
+	}
+}
+
+void _CreateHash_post(hook_struct* e, hook_function* _f) {
+	log("frame %d: hash index %d type %d -> %04x\n", g_frame_count, *(uint8_t*)0x65EB2E, (uint8_t)e->_eax, e->retval);
+
+	void*& first_visible_unit = *(void**)0x628430;
+	for (void* u = first_visible_unit; u; u = offset<void*>(u, 0x4)) {
+		size_t index = ((char*)u - (char*)0x59CCA8) / 0x150;
+		int gen = offset<uint8_t>(u, 0xa5);
+		int unit_type = offset<uint16_t>(u, 0x64);
+		int shields = offset<int32_t>(u, 0x60);
+		int hp = offset<int32_t>(u, 0x8);
+		void* sprite = offset<void*>(u, 0xc);
+		int sprite_x = offset<int16_t>(sprite, 0x14);
+		int sprite_y = offset<int16_t>(sprite, 0x16);
+
+		log("u %d %d %d %d %d %d %d\n", index, gen, unit_type, shields, hp, sprite_x, sprite_y);
+	}
+
+}
+
 struct ConnectNamedPipe_thread_info {
 	std::atomic<int> state;
 	BOOL retval;
@@ -750,15 +786,33 @@ void _SRegLoadString_post(hook_struct* e, hook_function* _f) {
 	}
 }
 
+void _sendto_pre(hook_struct* e, hook_function* _f) {
+	if (opt_lan_sendto && e->arg[5] == sizeof(sockaddr_in)) {
+ 		sockaddr_in* src_sa = (sockaddr_in*)e->arg[4];
+		sockaddr_in* dst_sa = (sockaddr_in*)&e->user[0];
+		memcpy(dst_sa, src_sa, sizeof(sockaddr_in));
+		dst_sa->sin_addr.s_addr = opt_lan_sendto;
+		e->ref_arg[4] = (uint32_t)dst_sa;
+	}
+}
+
 std::vector<std::string> opt_dlls;
 
 void init() {
 
 	HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+	if (!kernel32) fatal_error("kernel32.dll is null");
 	hook(GetProcAddress(kernel32, "ConnectNamedPipe"), _ConnectNamedPipe_pre, nullptr, HOOK_STDCALL, 2);
 
 	HMODULE storm = GetModuleHandleA("storm.dll");
+	if (!kernel32) fatal_error("storm.dll is null");
 	hook(GetProcAddress(storm, (char*)422), nullptr, _SRegLoadString_post, HOOK_STDCALL, 5);
+
+	if (opt_lan_sendto) {
+		HMODULE ws2_32 = LoadLibraryA("ws2_32.dll");
+		if (!kernel32) fatal_error("failed to load ws2_32.dll");
+		hook(GetProcAddress(ws2_32, "sendto"), _sendto_pre, nullptr, HOOK_STDCALL, 6);
+	}
 
 	for (auto& v : opt_dlls) {
 		log("loading %s...", v);
@@ -792,6 +846,11 @@ void init() {
 	hook((void*)0x40C8D5, _signal_pre, nullptr, HOOK_CDECL, 2);
 
 	hook((void*)0x4CBC40, _CHK_VCOD_pre, nullptr, HOOK_STDCALL, 3);
+	
+	hook((void*)0x47CDD0, nullptr, _CMD_GameHash_post, HOOK_CDECL | hookflag_edi, 0);
+
+	//hook((void*)0x47CF10, nullptr, _CreateHash_post, HOOK_CDECL | hookflag_eax, 0);
+	
 
 }
 
@@ -841,11 +900,22 @@ int parse_args(int argc, const char** argv) {
 		log("                    will be joined.\n");
 		log("  -n, --name NAME   The player name. Default 'playername'.\n");
 		log("  -g, --game NAME   The game name when hosting. Defaults to the player name.\n");
+		log("                    If this option is specified when joining, then only games\n");
+		log("                    with the specified name will be joined.\n");
 		log("  -m, --map FILE    The map to use when hosting.\n");
-		log("  -r, --race RACE   Zerg, Terran, Protoss or Random (case insensitive).\n");
-		log("                    Can also be the number 0, 1, 2 or 6 respectively.\n");
+		log("  -r, --race RACE   Zerg/Terran/Protoss/Random/Z/T/P/R (case insensitive).\n");
 		log("  -l, --dll DLL     Load DLL into StarCraft. This option can be\n");
 		log("                    specified multiple times to load multiple dlls.\n");
+		log("      --networkprovider NAME  Use the specified network provider.\n");
+		log("                              'UDPN' is LAN (UDP), 'SMEM' is Local PC (provided\n");
+		log("                              by BWAPI). Others are provided by .snp files and\n");
+		log("                              may or may not work. Default SMEM.\n");
+		log("      --lan         Sets the network provider to LAN (UDP).\n");
+		log("      --localpc     Sets the network provider to Local PC (this is default).\n");
+		log("      --lan-sendto IP  Overrides the IP that UDP packets are sent to. This\n");
+		log("                       can be used together with --lan to connect to a\n");
+		log("                       specified IP-address instead of broadcasting for games\n");
+		log("                       on LAN (The ports used is 6111 and 6112).\n");
 	};
 
 	for (int i = 1; i < argc; ++i) {
@@ -875,16 +945,32 @@ int parse_args(int argc, const char** argv) {
 			opt_map_fn = parm();
 		} else if (!strcmp(s, "--race") || !strcmp(s, "-r")) {
 			const char* str = parm();
-			if (!_stricmp(str, "zerg")) opt_race = 0;
-			else if (!_stricmp(str, "terran")) opt_race = 1;
-			else if (!_stricmp(str, "protoss")) opt_race = 2;
-			else if (!_stricmp(str, "random")) opt_race = 6;
+			if (!_stricmp(str, "zerg") || !_stricmp(str, "z")) opt_race = 0;
+			else if (!_stricmp(str, "terran") || !_stricmp(str, "t")) opt_race = 1;
+			else if (!_stricmp(str, "protoss") || !_stricmp(str, "p")) opt_race = 2;
+			else if (!_stricmp(str, "random") || !_stricmp(str, "r")) opt_race = 6;
 			else opt_race = std::atoi(str);
 		} else if (!strcmp(s, "--help")) {
 			usage();
 			return -1;
 		} else if (!strcmp(s, "--dll") || !strcmp(s, "-l")) {
 			opt_dlls.push_back(parm());
+		} else if (!strcmp(s, "--networkprovider")) {
+			opt_network_provider = parm();
+		} else if (!strcmp(s, "--lan")) {
+			opt_network_provider = "UDPN";
+		} else if (!strcmp(s, "--localpc")) {
+			opt_network_provider = "SMEM";
+		} else if (!strcmp(s, "--lan-sendto")) {
+			const char* c = parm();
+			uint32_t ip = 0;
+			for (int i = 0; i < 4; ++i) {
+				ip |= (atoi(c) & 0xff) << (i * 8);
+				while (*c >= '0' && *c <= '9') ++c;
+				if (*c != '.') break;
+				++c;
+			}
+			opt_lan_sendto = ip;
 		} else {
 			log("%s: error: invalid argument '%s'\n", argv[0], s);
 			log("Use --help to see a list of valid arguments.\n");
@@ -893,7 +979,7 @@ int parse_args(int argc, const char** argv) {
 		if (failed) return -1;
 	}
 
-	if (opt_game_name.empty()) opt_game_name = opt_player_name;
+	if (opt_game_name.empty() && opt_host_game) opt_game_name = opt_player_name;
 
 	if (opt_host_game && opt_map_fn.empty()) {
 		log("%s: error: You must specify a map (-m filename) when hosting.\n", argv[0]);
