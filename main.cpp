@@ -251,6 +251,7 @@ std::string opt_map_fn;
 int opt_race = 6;
 std::string opt_network_provider = "SMEM";
 uint32_t opt_lan_sendto = 0;
+std::string opt_installpath;
 
 void run() {
 
@@ -773,16 +774,25 @@ void _ConnectNamedPipe_pre(hook_struct* e, hook_function* _f) {
 // The fallback path is blank, which it appends a slash to, so we provide a
 // better fallback here.
 void _SRegLoadString_post(hook_struct* e, hook_function* _f) {
-	if (!e->retval && !strcmp((const char*)e->arg[1], "InstallPath")) {
+	auto set = [&](const std::string& str) {
 		char* dst = (char*)e->arg[3];
 		size_t size = (size_t)e->arg[4];
-		if (size >= module_directory.size() + 1) memcpy(dst, module_directory.data(), module_directory.size() + 1);
+		if (size >= str.size() + 1) memcpy(dst, str.data(), str.size() + 1);
 		else {
 			if (size) {
-				memcpy(dst, module_directory.data(), size - 1);
+				memcpy(dst, str.data(), size - 1);
 				dst[size - 1] = 0;
 			}
 		}
+	};
+	if (!opt_installpath.empty()) {
+		if (!strcmp((const char*)e->arg[1], "InstallPath")) {
+			set(opt_installpath);
+		}
+		return;
+	}
+	if (!e->retval && !strcmp((const char*)e->arg[1], "InstallPath")) {
+		set(module_directory);
 	}
 }
 
@@ -916,6 +926,9 @@ int parse_args(int argc, const char** argv) {
 		log("                       can be used together with --lan to connect to a\n");
 		log("                       specified IP-address instead of broadcasting for games\n");
 		log("                       on LAN (The ports used is 6111 and 6112).\n");
+		log("      --installpath PATH  Overrides the InstallPath value that would usually\n");
+		log("                          be read from the registry. This is used by BWAPI to\n");
+		log("                          locate bwapi-data/bwapi.ini.\n");
 	};
 
 	for (int i = 1; i < argc; ++i) {
@@ -971,6 +984,8 @@ int parse_args(int argc, const char** argv) {
 				++c;
 			}
 			opt_lan_sendto = ip;
+		} else if (!strcmp(s, "--installpath")) {
+			opt_installpath = parm();
 		} else {
 			log("%s: error: invalid argument '%s'\n", argv[0], s);
 			log("Use --help to see a list of valid arguments.\n");
