@@ -252,6 +252,7 @@ int opt_race = 6;
 std::string opt_network_provider = "SMEM";
 uint32_t opt_lan_sendto = 0;
 std::string opt_installpath;
+bool opt_headful = false;
 
 void run() {
 
@@ -609,12 +610,24 @@ void _timeoutProcDropdown_pre(hook_struct* e, hook_function* _f) {
 
 	bool& allow_send_turn = *(bool*)0x57EE78;
 
+	DWORD drop_time_start = GetTickCount();
+	DWORD last_print_waiting_for_players = 0;
+
 	while (!allow_send_turn) {
-		log("waiting for players...\n");
+		Sleep(250);
+
+		DWORD now = GetTickCount();
+		if (now - drop_time_start >= 45 * 1000) {
+			((void(*)())0x4A3010)(); // drop_lagging_players
+		}
+
+		if (last_print_waiting_for_players == 0 || now - last_print_waiting_for_players >= 5000) {
+			last_print_waiting_for_players = now;
+			log("waiting for players...\n");
+		}
 		((int(*)())0x485F70)(); // RecvMessage
 
-		int r = ((int(*)())0x486580)(); // RecvSaveTurns
-		Sleep(250);
+		((int(*)())0x486580)(); // RecvSaveTurns
 	}
 
 }
@@ -732,41 +745,41 @@ struct ConnectNamedPipe_thread_info {
 	std::atomic<int> state;
 	BOOL retval;
 	DWORD last_error;
-	std::thread t;
+	HANDLE h;
+	void* func;
+	DWORD last_connect = 0;
 };
 std::map<HANDLE, ConnectNamedPipe_thread_info> ConnectNamedPipe_ti;
-std::mutex ConnectNamedPipe_mut;
 // Wine does not respect PIPE_NOWAIT in ConnectNamedPipe, which causes
 // BWAPI to hang. We fix that here.
+// std::thread also fails in some versions of Wine, so we use CreateThread.
 void _ConnectNamedPipe_pre(hook_struct* e, hook_function* _f) {
-	std::lock_guard<std::mutex> l(ConnectNamedPipe_mut);
-	for (auto& v : ConnectNamedPipe_ti) {
-		if (v.second.t.get_id() == std::this_thread::get_id()) return;
-	}
 	HANDLE h = (HANDLE)e->arg[0];
-	DWORD pipe_state = 0;
-	if (GetNamedPipeHandleStateW(h, &pipe_state, nullptr, nullptr, nullptr, nullptr, 0)) {
-		if (pipe_state & PIPE_NOWAIT) {
-			e->calloriginal = false;
-			auto& i = ConnectNamedPipe_ti[h];
-			if (i.state == 2) {
-				i.state = 0;
-				e->retval = i.retval;
-				SetLastError(i.last_error);
-			} else {
-				if (i.state == 0) {
-					i.state = 1;
-					if (i.t.joinable()) i.t.join();
-					i.t = std::thread([h, i = &i, _f]() {
-						i->retval = ConnectNamedPipe(h, nullptr);
-						i->last_error = GetLastError();
-						i->state = 2;
-					});
-				}
-				e->retval = 0;
-				SetLastError(ERROR_PIPE_LISTENING);
-			}
+	e->calloriginal = false;
+	auto& i = ConnectNamedPipe_ti[h];
+	if (i.state == 2) {
+		i.state = 0;
+		e->retval = i.retval;
+		SetLastError(i.last_error);
+	} else {
+		if (i.state == 0) {
+			i.state = 1;
+			i.h = h;
+			i.func = _f->entry;
+			HANDLE h = CreateThread(nullptr, 0, [](void* ptr) {
+				auto* i = (ConnectNamedPipe_thread_info*)ptr;
+				DWORD now = GetTickCount();
+				if (now - i->last_connect <= 500) Sleep(500 - (now - i->last_connect));
+				i->retval = ((BOOL(__stdcall*)(HANDLE, void*))i->func)(i->h, nullptr);
+				i->last_error = GetLastError();
+				i->state = 2;
+				return (DWORD)0;
+			}, &i, 0, nullptr);
+			if (h) CloseHandle(h);
+			else i.state = 0;
 		}
+		e->retval = 0;
+		SetLastError(ERROR_PIPE_LISTENING);
 	}
 }
 
@@ -820,7 +833,7 @@ void init() {
 
 	if (opt_lan_sendto) {
 		HMODULE ws2_32 = LoadLibraryA("ws2_32.dll");
-		if (!kernel32) fatal_error("failed to load ws2_32.dll");
+		if (!ws2_32) fatal_error("failed to load ws2_32.dll");
 		hook(GetProcAddress(ws2_32, "sendto"), _sendto_pre, nullptr, HOOK_STDCALL, 6);
 	}
 
@@ -835,31 +848,35 @@ void init() {
 		}
 	}
 
-	hook((void*)0x4E0AE0, _WinMain_pre, nullptr, HOOK_STDCALL, 4);
+	if (!opt_headful) {
 
-	hook((void*)0x4BB300, _doNetTBLError_pre, nullptr, HOOK_STDCALL | hookflag_eax | hookflag_ecx | hookflag_edx, 1);
+		hook((void*)0x4E0AE0, _WinMain_pre, nullptr, HOOK_STDCALL, 4);
 
-	hook((void*)0x4B8F10, _on_lobby_chat_pre, nullptr, HOOK_STDCALL | hookflag_eax, 1);
+		hook((void*)0x4BB300, _doNetTBLError_pre, nullptr, HOOK_STDCALL | hookflag_eax | hookflag_ecx | hookflag_edx, 1);
 
-	hook((void*)0x44FD30, _on_lobby_start_game_pre, nullptr, HOOK_STDCALL, 1);
+		hook((void*)0x4B8F10, _on_lobby_chat_pre, nullptr, HOOK_STDCALL | hookflag_eax, 1);
 
-	hook((void*)0x4A3380, _timeoutProcDropdown_pre, nullptr, HOOK_CDECL, 0);
+		hook((void*)0x44FD30, _on_lobby_start_game_pre, nullptr, HOOK_STDCALL, 1);
 
-	hook((void*)0x484CC0, _SetInGameInputProcs_pre, nullptr, HOOK_CDECL, 0);
+		hook((void*)0x4A3380, _timeoutProcDropdown_pre, nullptr, HOOK_CDECL, 0);
 
-	hook((void*)0x48CD30, _DisplayTextMessage_pre, nullptr, HOOK_STDCALL | hookflag_eax, 3);
+		hook((void*)0x484CC0, _SetInGameInputProcs_pre, nullptr, HOOK_CDECL, 0);
 
-	hook((void*)0x4208E0, _ErrMessageBox_pre, nullptr, HOOK_CDECL | hookflag_eax, 2);
+		hook((void*)0x48CD30, _DisplayTextMessage_pre, nullptr, HOOK_STDCALL | hookflag_eax, 3);
 
-	hook((void*)0x4212C0, _SysWarn_FileNotFound, nullptr, HOOK_STDCALL | hookflag_ebx, 2);
+		hook((void*)0x4208E0, _ErrMessageBox_pre, nullptr, HOOK_CDECL | hookflag_eax, 2);
 
-	hook((void*)0x40C8D5, _signal_pre, nullptr, HOOK_CDECL, 2);
+		hook((void*)0x4212C0, _SysWarn_FileNotFound, nullptr, HOOK_STDCALL | hookflag_ebx, 2);
 
-	hook((void*)0x4CBC40, _CHK_VCOD_pre, nullptr, HOOK_STDCALL, 3);
-	
-	hook((void*)0x47CDD0, nullptr, _CMD_GameHash_post, HOOK_CDECL | hookflag_edi, 0);
+		hook((void*)0x40C8D5, _signal_pre, nullptr, HOOK_CDECL, 2);
 
-	//hook((void*)0x47CF10, nullptr, _CreateHash_post, HOOK_CDECL | hookflag_eax, 0);
+		hook((void*)0x4CBC40, _CHK_VCOD_pre, nullptr, HOOK_STDCALL, 3);
+
+		hook((void*)0x47CDD0, nullptr, _CMD_GameHash_post, HOOK_CDECL | hookflag_edi, 0);
+
+		//hook((void*)0x47CF10, nullptr, _CreateHash_post, HOOK_CDECL | hookflag_eax, 0);
+
+	}
 	
 
 }
@@ -986,6 +1003,8 @@ int parse_args(int argc, const char** argv) {
 			opt_lan_sendto = ip;
 		} else if (!strcmp(s, "--installpath")) {
 			opt_installpath = parm();
+		} else if (!strcmp(s, "--headful")) {
+			opt_headful = true;
 		} else {
 			log("%s: error: invalid argument '%s'\n", argv[0], s);
 			log("Use --help to see a list of valid arguments.\n");
@@ -1094,7 +1113,7 @@ int main(int argc, const char** argv) {
 
 				// storm.dll fails to work if it is dynamically loaded. It detects this
 				// using the lpvReserved parameter of DllEntryPoint.
-				// The easy fix it to just set *(void*)(storm.dll + 0x5E5E4) to null
+				// The easy fix it to just set *(void**)(storm.dll + 0x5E5E4) to null
 				// after loading it. The other option is to manually load storm.dll
 				// and call DllEntryPoint with the "correct" parameters, but then BWAPI
 				// fails to work unless we redirect LoadLibrary/GetModuleHandle and 
