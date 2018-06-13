@@ -103,9 +103,9 @@ static bool load_pe(const char*path, pe_info*ri, bool overwrite = false, const s
 	// imports
 	pos = 0;
 	while (pos < oh.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size) {
-		PIMAGE_IMPORT_DESCRIPTOR import = (PIMAGE_IMPORT_DESCRIPTOR)((uint8_t*)addr + oh.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress + pos);
-		if (import->FirstThunk == 0) break;
-		const char*name = (const char*)addr + import->Name;
+		PIMAGE_IMPORT_DESCRIPTOR importDescriptor = (PIMAGE_IMPORT_DESCRIPTOR)((uint8_t*)addr + oh.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress + pos);
+		if (importDescriptor->FirstThunk == 0) break;
+		const char*name = (const char*)addr + importDescriptor->Name;
 		HMODULE hm = nullptr;
 		auto i = loaded_modules.find(name);
 		bool manually_loaded = i != loaded_modules.end();
@@ -115,7 +115,7 @@ static bool load_pe(const char*path, pe_info*ri, bool overwrite = false, const s
 			log("failed to load import library '%s'\n", name);
 			return cleanup();
 		} else {
-			DWORD*dw = (DWORD*)((uint8_t*)addr + import->OriginalFirstThunk);
+			DWORD*dw = (DWORD*)((uint8_t*)addr + importDescriptor->OriginalFirstThunk);
 			for (int i = 0; *dw; i++) {
 				FARPROC proc;
 				if (manually_loaded) {
@@ -126,12 +126,12 @@ static bool load_pe(const char*path, pe_info*ri, bool overwrite = false, const s
 
 					auto& exp_entry = hm_oh->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
 
-					PIMAGE_EXPORT_DIRECTORY export = (PIMAGE_EXPORT_DIRECTORY)((char*)hm + exp_entry.VirtualAddress);
+					PIMAGE_EXPORT_DIRECTORY exportDirectory = (PIMAGE_EXPORT_DIRECTORY)((char*)hm + exp_entry.VirtualAddress);
 
 					if (*dw & 0x80000000) {
-						DWORD* funcs = (DWORD*)((char*)hm + export->AddressOfFunctions);
-						DWORD index = (*dw & 0xffff) - export->Base;
-						if (index < export->NumberOfFunctions) proc = (FARPROC)((char*)hm + funcs[index]);
+						DWORD* funcs = (DWORD*)((char*)hm + exportDirectory->AddressOfFunctions);
+						DWORD index = (*dw & 0xffff) - exportDirectory->Base;
+						if (index < exportDirectory->NumberOfFunctions) proc = (FARPROC)((char*)hm + funcs[index]);
 						else proc = nullptr;
 					} else {
 						log("fixme: load name\n");
@@ -146,7 +146,7 @@ static bool load_pe(const char*path, pe_info*ri, bool overwrite = false, const s
 					}
 				}
 				if (proc) {
-					*((FARPROC*)((uint8_t*)addr + import->FirstThunk) + i) = proc;
+					*((FARPROC*)((uint8_t*)addr + importDescriptor->FirstThunk) + i) = proc;
 					//if (*dw&0x80000000) log("loaded %d from library '%s'\n",*dw&0xffff,name);
 					//else log("loaded '%s' from library '%s'\n",(const char*)addr + *dw + 2,name);
 				} else {
