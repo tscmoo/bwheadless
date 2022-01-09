@@ -1028,11 +1028,12 @@ int main(int argc, const char** argv) {
 
 	try {
 
-		output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
-
 		if (is_injected) {
 
-			AttachConsole(ATTACH_PARENT_PROCESS);
+			if(!AttachConsole(ATTACH_PARENT_PROCESS)) {
+				fatal_error("failed to attach to parent");
+			}
+			output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
 
 			log("attached\n");
 
@@ -1066,6 +1067,7 @@ int main(int argc, const char** argv) {
 			ExitThread(0);
 
 		} else {
+			output_handle = GetStdHandle(STD_OUTPUT_HANDLE);
 
 			int r = parse_args(argc, argv);
 			if (r) return r;

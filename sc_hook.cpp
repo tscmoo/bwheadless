@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <stdexcept>
 
 #include "codegen.h"
 #include "x86dec.h"
